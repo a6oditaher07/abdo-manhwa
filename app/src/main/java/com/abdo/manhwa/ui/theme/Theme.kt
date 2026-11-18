@@ -8,6 +8,8 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
+private val Color_OnAccent = androidx.compose.ui.graphics.Color(0xFF1A0B2E)
+
 // التطبيق يعتمد الوضع الداكن افتراضياً دائماً كما طلب المستخدم
 private val DarkScheme = darkColorScheme(
     primary = AccentPrimary,
@@ -23,8 +25,6 @@ private val DarkScheme = darkColorScheme(
     error = ErrorColor,
     outline = DividerDark
 )
-
-private val Color_OnAccent = androidx.compose.ui.graphics.Color(0xFF1A0B2E)
 
 @Composable
 fun AbdoManhwaTheme(content: @Composable () -> Unit) {
