@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- يمنع أي اتصال شبكة واضح (cleartext) تأكيداً على أن التطبيق يعمل محلياً فقط -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

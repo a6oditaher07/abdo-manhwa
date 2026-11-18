@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- السمة الأساسية للتطبيق (تُستخدم بعد شاشة البداية)؛ الواجهة نفسها مبنية بالكامل بـ Compose -->
+    <style name="Theme.AbdoManhwa" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/background_dark</item>
+        <item name="android:navigationBarColor">@color/background_dark</item>
+        <item name="android:windowBackground">@color/background_dark</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- سمة شاشة البداية باستخدام مكتبة Splash Screen الرسمية من أندرويد -->
+    <style name="Theme.AbdoManhwa.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/background_dark</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="postSplashScreenTheme">@style/Theme.AbdoManhwa</item>
+    </style>
+
+</resources>
