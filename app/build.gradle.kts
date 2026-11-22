@@ -20,6 +20,18 @@ android {
         }
     }
 
+    // توقيع ثابت لنسخة Debug: نفس بصمة التوقيع في كل بناء على GitHub Actions،
+    // حتى يُثبَّت ملف APK الجديد كتحديث فوق القديم بدون الحاجة لحذفه أولاً
+    // (بدون هذا، كل بناء جديد كان يولّد مفتاح توقيع مختلف فيرفضه أندرويد كـ"تعارض نسخ").
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -30,6 +42,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
