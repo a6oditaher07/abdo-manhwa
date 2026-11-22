@@ -2,13 +2,14 @@ package com.abdo.manhwa.ui.reader
 
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
-import android.view.View
 import android.view.WindowManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
@@ -16,8 +17,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -38,7 +37,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 
-@OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun ReaderScreen(
@@ -53,6 +51,10 @@ fun ReaderScreen(
     val view = LocalView.current
     val scope = rememberCoroutineScope()
 
+    // الفصل الحالي يُدار داخلياً (بدون التنقل عبر NavController) حتى لا تُعاد بناء الشاشة
+    // بالكامل عند كل انتقال بين الفصول — هذا هو ما كان يسبب ظهور الأشرطة وتغيّر السطوع فجأة.
+    var currentChapterId by remember { mutableStateOf(chapterId) }
+
     val state by viewModel.state.collectAsState()
     val brightness by viewModel.brightness.collectAsState(initial = -1f)
     val eyeComfort by viewModel.eyeComfort.collectAsState(initial = false)
@@ -64,9 +66,13 @@ fun ReaderScreen(
     var chapterListData by remember { mutableStateOf<List<ChapterEntity>>(emptyList()) }
     var loadError by remember { mutableStateOf(false) }
 
-    LaunchedEffect(mangaId, chapterId) {
+    fun goToChapter(id: Long) {
         loadError = false
-        viewModel.loadChapter(mangaId, chapterId)
+        currentChapterId = id
+    }
+
+    LaunchedEffect(currentChapterId) {
+        viewModel.loadChapter(mangaId, currentChapterId)
     }
 
     // ───── الوضع الغامر (Immersive): إخفاء شريط الحالة وشريط التنقل ─────
@@ -112,6 +118,8 @@ fun ReaderScreen(
     }
 
     // ───── السطوع الخاص بالتطبيق فقط (لا يغيّر سطوع النظام العام) ─────
+    // ملاحظة: بما أن الشاشة لم تعد تُعاد بناؤها عند تغيير الفصل، هذا الـ Effect لا يُعاد تشغيله
+    // إلا عند تغيّر قيمة السطوع فعلياً، فلا يحدث "وميض" أو تغيّر مفاجئ بين الفصول.
     DisposableEffect(brightness) {
         val window = activity?.window
         val layoutParams = window?.attributes
@@ -124,7 +132,7 @@ fun ReaderScreen(
         }
     }
 
-    // ───── حفظ تلقائي لموضع القراءة كل بضع ثوانٍ ─────
+    // ───── حفظ تلقائي لموضع القراءة كل بضع ثوانٍ، واكتشاف نهاية الفصل ─────
     LaunchedEffect(state.chapter?.id) {
         val wv = webViewRef
         if (wv == null || state.chapter == null) return@LaunchedEffect
@@ -133,7 +141,7 @@ fun ReaderScreen(
             readScrollPercent(wv) { percent ->
                 if (percent != null) {
                     viewModel.saveProgress(percent)
-                    if (percent >= 0.97f && !state.showNextChapterCard) {
+                    if (percent >= 0.97f && state.transition == null) {
                         viewModel.onReachedEnd()
                     }
                 }
@@ -150,6 +158,19 @@ fun ReaderScreen(
                     if (percent != null) viewModel.saveProgress(percent)
                 }
             }
+        }
+    }
+
+    // ───── الانتقال التلقائي للفصل التالي بعد ظهور الفاصل البسيط بينهما ─────
+    LaunchedEffect(state.transition) {
+        val transition = state.transition ?: return@LaunchedEffect
+        if (transition.isLastChapter) return@LaunchedEffect
+        delay(1400) // مدة ظهور الفاصل قبل المتابعة التلقائية
+        val nextId = viewModel.nextChapterId()
+        if (nextId != null) {
+            goToChapter(nextId)
+        } else {
+            viewModel.clearTransition()
         }
     }
 
@@ -205,6 +226,7 @@ fun ReaderScreen(
                     },
                     update = { wv ->
                         if (!wv.url.orEmpty().endsWith(File(chapterPath).name)) {
+                            loadError = false
                             wv.loadUrl("file://" + File(chapterPath).absolutePath)
                         }
                     }
@@ -288,7 +310,7 @@ fun ReaderScreen(
                 ) {
                     IconButton(onClick = {
                         scope.launch {
-                            viewModel.previousChapterId()?.let { onNavigateToChapter(it) }
+                            viewModel.previousChapterId()?.let { goToChapter(it) }
                         }
                     }, enabled = state.hasPrevious) {
                         Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "الفصل السابق", tint = if (state.hasPrevious) Color.White else Color.White.copy(alpha = 0.3f))
@@ -313,7 +335,7 @@ fun ReaderScreen(
 
                     IconButton(onClick = { viewModel.setKeepScreenOn(!keepScreenOn) }) {
                         Icon(
-                            if (keepScreenOn) Icons.Filled.LightMode else Icons.Filled.LightMode,
+                            Icons.Filled.LightMode,
                             contentDescription = "إبقاء الشاشة مضاءة",
                             tint = if (keepScreenOn) AccentPrimary else Color.White.copy(alpha = 0.5f)
                         )
@@ -329,7 +351,7 @@ fun ReaderScreen(
 
                     IconButton(onClick = {
                         scope.launch {
-                            viewModel.nextChapterId()?.let { onNavigateToChapter(it) }
+                            viewModel.nextChapterId()?.let { goToChapter(it) }
                         }
                     }, enabled = state.hasNext) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "الفصل التالي", tint = if (state.hasNext) Color.White else Color.White.copy(alpha = 0.3f))
@@ -338,29 +360,18 @@ fun ReaderScreen(
             }
         }
 
-        // ───── بطاقة "الفصل التالي" عند نهاية الفصل ─────
-        if (state.showNextChapterCard && state.hasNext) {
-            Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.BottomCenter) {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1C1726)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("انتهيت من هذا الفصل 🎉", color = Color.White, style = MaterialTheme.typography.titleMedium)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Button(
-                            onClick = {
-                                scope.launch {
-                                    viewModel.nextChapterId()?.let { onNavigateToChapter(it) }
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = AccentPrimary),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("الانتقال إلى الفصل التالي")
-                        }
-                    }
-                }
+        // ───── فاصل بسيط وغير قابل للضغط بين الفصلين، يظهر وينتقل تلقائياً ─────
+        // لا يوجد هنا أي زر "الفصل التالي" يحتاج ضغطاً، ولا يُظهر أي شريط تحكم؛
+        // فقط خط رفيع بالمنتصف مكتوب فيه الوقت الذي قُضي في الفصل، ثم يتابع القارئ تلقائياً.
+        AnimatedVisibility(
+            visible = state.transition != null,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.Center)
+        ) {
+            val transition = state.transition
+            if (transition != null) {
+                ChapterDivider(transition = transition)
             }
         }
     }
@@ -372,11 +383,62 @@ fun ReaderScreen(
                 currentChapterId = state.chapter?.id,
                 onSelect = {
                     showChapterList = false
-                    onNavigateToChapter(it)
+                    goToChapter(it)
                 }
             )
         }
     }
+}
+
+@Composable
+private fun ChapterDivider(transition: ChapterTransition) {
+    val minutes = transition.elapsedSeconds / 60
+    val seconds = transition.elapsedSeconds % 60
+    val timeText = if (minutes > 0) "${minutes} د ${seconds} ث" else "${seconds} ث"
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            HorizontalDividerLine()
+            Column(
+                modifier = Modifier
+                    .background(Color(0xCC1C1726), shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(Icons.Filled.Schedule, contentDescription = null, tint = Color.White.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    "قضيت $timeText في هذا الفصل",
+                    color = Color.White.copy(alpha = 0.85f),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (!transition.isLastChapter) {
+                    Text(
+                        "...جاري الانتقال للفصل التالي",
+                        color = Color.White.copy(alpha = 0.5f),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                } else {
+                    Text(
+                        "هذا آخر فصل متوفر",
+                        color = Color.White.copy(alpha = 0.5f),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+            HorizontalDividerLine()
+        }
+    }
+}
+
+@Composable
+private fun HorizontalDividerLine() {
+    Box(
+        modifier = Modifier
+            .width(28.dp)
+            .height(1.dp)
+            .background(Color.White.copy(alpha = 0.25f))
+    )
 }
 
 @Composable
