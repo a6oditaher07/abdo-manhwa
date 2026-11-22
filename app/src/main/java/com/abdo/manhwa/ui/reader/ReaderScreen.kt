@@ -268,7 +268,7 @@ fun ReaderScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = onBack) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "رجوع", tint = Color.White)
+                    Icon(Icons.Filled.ArrowBack, contentDescription = "رجوع", tint = Color.White)
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(state.manga?.title ?: "", color = Color.White, style = MaterialTheme.typography.titleMedium, maxLines = 1)
@@ -313,7 +313,7 @@ fun ReaderScreen(
                             viewModel.previousChapterId()?.let { goToChapter(it) }
                         }
                     }, enabled = state.hasPrevious) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "الفصل السابق", tint = if (state.hasPrevious) Color.White else Color.White.copy(alpha = 0.3f))
+                        Icon(Icons.Filled.ArrowForward, contentDescription = "الفصل السابق", tint = if (state.hasPrevious) Color.White else Color.White.copy(alpha = 0.3f))
                     }
 
                     IconButton(onClick = {
@@ -354,7 +354,7 @@ fun ReaderScreen(
                             viewModel.nextChapterId()?.let { goToChapter(it) }
                         }
                     }, enabled = state.hasNext) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "الفصل التالي", tint = if (state.hasNext) Color.White else Color.White.copy(alpha = 0.3f))
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "الفصل التالي", tint = if (state.hasNext) Color.White else Color.White.copy(alpha = 0.3f))
                     }
                 }
             }
