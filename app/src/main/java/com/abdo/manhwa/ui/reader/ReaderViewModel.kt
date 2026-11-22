@@ -9,6 +9,12 @@ import com.abdo.manhwa.data.repository.MangaRepository
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
+/** يمثل الفاصل الصغير الذي يظهر بين فصلين أثناء الانتقال التلقائي */
+data class ChapterTransition(
+    val elapsedSeconds: Long,
+    val isLastChapter: Boolean
+)
+
 data class ReaderUiState(
     val manga: MangaEntity? = null,
     val chapter: ChapterEntity? = null,
@@ -16,7 +22,7 @@ data class ReaderUiState(
     val fileMissing: Boolean = false,
     val hasNext: Boolean = false,
     val hasPrevious: Boolean = false,
-    val showNextChapterCard: Boolean = false,
+    val transition: ChapterTransition? = null,
     val controlsVisible: Boolean = true
 )
 
@@ -35,10 +41,14 @@ class ReaderViewModel(
 
     private var mangaId: Long = -1
 
+    // وقت بداية قراءة الفصل الحالي، يُستخدم لحساب الوقت المعروض في الفاصل بين الفصول
+    private var chapterStartTimeMs: Long = System.currentTimeMillis()
+
     fun loadChapter(mangaId: Long, chapterId: Long) {
         this.mangaId = mangaId
+        chapterStartTimeMs = System.currentTimeMillis()
         viewModelScope.launch {
-            _state.update { it.copy(isLoading = true, showNextChapterCard = false) }
+            _state.update { it.copy(isLoading = true, transition = null) }
             val manga = repository.getManga(mangaId)
             val chapter = repository.getChapter(chapterId)
             if (chapter == null) {
@@ -55,7 +65,8 @@ class ReaderViewModel(
                     isLoading = false,
                     fileMissing = !exists,
                     hasNext = next != null,
-                    hasPrevious = prev != null
+                    hasPrevious = prev != null,
+                    transition = null
                 )
             }
         }
@@ -69,12 +80,21 @@ class ReaderViewModel(
         _state.update { it.copy(controlsVisible = visible) }
     }
 
+    /** يُستدعى عند وصول القارئ لنهاية الفصل: يعلّمه كمقروء ويحسب الوقت المستغرق لعرضه في الفاصل */
     fun onReachedEnd() {
         val chapter = _state.value.chapter ?: return
+        if (_state.value.transition != null) return // تجنّب التكرار
+        val elapsedSeconds = ((System.currentTimeMillis() - chapterStartTimeMs) / 1000L).coerceAtLeast(1)
         viewModelScope.launch {
             repository.markChapterRead(chapter)
-            _state.update { it.copy(showNextChapterCard = true) }
+            _state.update {
+                it.copy(transition = ChapterTransition(elapsedSeconds = elapsedSeconds, isLastChapter = !it.hasNext))
+            }
         }
+    }
+
+    fun clearTransition() {
+        _state.update { it.copy(transition = null) }
     }
 
     fun saveProgress(scrollPercent: Float) {
