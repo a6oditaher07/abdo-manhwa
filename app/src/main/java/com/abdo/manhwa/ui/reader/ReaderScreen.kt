@@ -38,6 +38,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 
 @SuppressLint("SetJavaScriptEnabled")
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ReaderScreen(
     viewModel: ReaderViewModel,
