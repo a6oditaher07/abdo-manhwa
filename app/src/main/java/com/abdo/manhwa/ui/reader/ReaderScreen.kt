@@ -16,6 +16,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -53,7 +55,7 @@ fun ReaderScreen(
     val scope = rememberCoroutineScope()
 
     // الفصل الحالي يُدار داخلياً (بدون التنقل عبر NavController) حتى لا تُعاد بناء الشاشة
-    // بالكامل عند كل انتقال بين الفصول — هذا هو ما كان يسبب ظهور الأشرطة وتغيّر السطوع فجأة.
+    // بالكامل عند كل انتقال بين الفصول — هذا كان يسبب ظهور الأشرطة وتغيّر السطوع فجأة سابقاً.
     var currentChapterId by remember { mutableStateOf(chapterId) }
 
     val state by viewModel.state.collectAsState()
@@ -67,13 +69,41 @@ fun ReaderScreen(
     var chapterListData by remember { mutableStateOf<List<ChapterEntity>>(emptyList()) }
     var loadError by remember { mutableStateOf(false) }
 
+    // ───── قفل أدوات التحكم: يخفي كل الأشرطة والأزرار ويمنع ظهورها باللمس العادي ─────
+    var isLocked by remember { mutableStateOf(false) }
+    var showUnlockHint by remember { mutableStateOf(false) }
+
+    // ───── شريط تمرير الموضع داخل الفصل (نسبة مئوية) ─────
+    var sliderPercent by remember { mutableStateOf(0f) }
+    var isDraggingSlider by remember { mutableStateOf(false) }
+
+    val barsVisible = state.controlsVisible && !isLocked
+
     fun goToChapter(id: Long) {
         loadError = false
         currentChapterId = id
     }
 
+    fun handleCenterTap() {
+        if (isLocked) {
+            if (showUnlockHint) {
+                isLocked = false
+                showUnlockHint = false
+            } else {
+                showUnlockHint = true
+                scope.launch {
+                    delay(2200)
+                    showUnlockHint = false
+                }
+            }
+        } else {
+            viewModel.toggleControls()
+        }
+    }
+
     LaunchedEffect(currentChapterId) {
         viewModel.loadChapter(mangaId, currentChapterId)
+        sliderPercent = 0f
     }
 
     // ───── الوضع الغامر (Immersive): إخفاء شريط الحالة وشريط التنقل ─────
@@ -119,8 +149,6 @@ fun ReaderScreen(
     }
 
     // ───── السطوع الخاص بالتطبيق فقط (لا يغيّر سطوع النظام العام) ─────
-    // ملاحظة: بما أن الشاشة لم تعد تُعاد بناؤها عند تغيير الفصل، هذا الـ Effect لا يُعاد تشغيله
-    // إلا عند تغيّر قيمة السطوع فعلياً، فلا يحدث "وميض" أو تغيّر مفاجئ بين الفصول.
     DisposableEffect(brightness) {
         val window = activity?.window
         val layoutParams = window?.attributes
@@ -150,6 +178,18 @@ fun ReaderScreen(
         }
     }
 
+    // ───── تحديث شريط التمرير المرئي بموضع القراءة الحالي (فقط أثناء ظهور الأشرطة ومن غير سحب يدوي) ─────
+    LaunchedEffect(state.chapter?.id, barsVisible) {
+        if (!barsVisible) return@LaunchedEffect
+        val wv = webViewRef ?: return@LaunchedEffect
+        while (true) {
+            if (!isDraggingSlider) {
+                readScrollPercent(wv) { percent -> if (percent != null) sliderPercent = percent }
+            }
+            delay(600)
+        }
+    }
+
     // ───── حفظ عند الخروج من الشاشة ─────
     DisposableEffect(state.chapter?.id) {
         onDispose {
@@ -165,13 +205,17 @@ fun ReaderScreen(
     // ───── الانتقال التلقائي للفصل التالي بعد ظهور الفاصل البسيط بينهما ─────
     LaunchedEffect(state.transition) {
         val transition = state.transition ?: return@LaunchedEffect
+        val originChapterId = state.chapter?.id
         if (transition.isLastChapter) return@LaunchedEffect
         delay(1400) // مدة ظهور الفاصل قبل المتابعة التلقائية
-        val nextId = viewModel.nextChapterId()
-        if (nextId != null) {
-            goToChapter(nextId)
-        } else {
-            viewModel.clearTransition()
+        // تأكد أن المستخدم ما انتقل يدوياً بالفعل أثناء الانتظار (مثل الضغط على زر "الفصل التالي")
+        if (viewModel.state.value.chapter?.id == originChapterId) {
+            val nextId = viewModel.nextChapterId()
+            if (nextId != null) {
+                goToChapter(nextId)
+            } else {
+                viewModel.clearTransition()
+            }
         }
     }
 
@@ -184,7 +228,7 @@ fun ReaderScreen(
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
-                        ManhwaWebView(ctx, onCenterTap = { viewModel.toggleControls() }).apply {
+                        ManhwaWebView(ctx, onCenterTap = { handleCenterTap() }).apply {
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.allowFileAccess = true
@@ -253,9 +297,9 @@ fun ReaderScreen(
             }
         }
 
-        // ───── الشريط العلوي ─────
+        // ───── الشريط العلوي: رجوع، العنوان، الفصل الحالي، وسهم تخطّي سريع للفصل التالي ─────
         AnimatedVisibility(
-            visible = state.controlsVisible,
+            visible = barsVisible,
             enter = slideInVertically { -it },
             exit = slideOutVertically { -it },
             modifier = Modifier.align(Alignment.TopCenter)
@@ -275,12 +319,51 @@ fun ReaderScreen(
                     Text(state.manga?.title ?: "", color = Color.White, style = MaterialTheme.typography.titleMedium, maxLines = 1)
                     Text(state.chapter?.title ?: "", color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodySmall)
                 }
+                IconButton(onClick = {
+                    scope.launch { viewModel.nextChapterId()?.let { goToChapter(it) } }
+                }, enabled = state.hasNext) {
+                    Icon(
+                        Icons.Filled.ChevronRight,
+                        contentDescription = "تخطّي إلى الفصل التالي",
+                        tint = if (state.hasNext) Color.White else Color.White.copy(alpha = 0.3f)
+                    )
+                }
+            }
+        }
+
+        // ───── زر المفضّلة العائم (نجمة) على جانب الشاشة ─────
+        AnimatedVisibility(
+            visible = barsVisible,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.CenterStart).padding(start = 12.dp)
+        ) {
+            val isFavorite = state.manga?.isFavorite == true
+            Row(
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))
+                    .clickable { viewModel.toggleFavorite() }
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    if (isFavorite) Icons.Filled.Star else Icons.Filled.StarBorder,
+                    contentDescription = "المفضّلة",
+                    tint = if (isFavorite) Color(0xFFFFC107) else Color.White,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    "المفضلة",
+                    color = if (isFavorite) Color(0xFFFFC107) else Color.White,
+                    style = MaterialTheme.typography.labelSmall
+                )
             }
         }
 
         // ───── الشريط السفلي ─────
         AnimatedVisibility(
-            visible = state.controlsVisible,
+            visible = barsVisible,
             enter = slideInVertically { it },
             exit = slideOutVertically { it },
             modifier = Modifier.align(Alignment.BottomCenter)
@@ -291,6 +374,73 @@ fun ReaderScreen(
                     .background(Color.Black.copy(alpha = 0.6f))
                     .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
+                // صف التنقل بين الفصول
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = {
+                        scope.launch { viewModel.previousChapterId()?.let { goToChapter(it) } }
+                    }, enabled = state.hasPrevious) {
+                        Icon(Icons.Filled.ArrowForward, contentDescription = "الفصل السابق", tint = if (state.hasPrevious) Color.White else Color.White.copy(alpha = 0.3f))
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable {
+                                scope.launch {
+                                    chapterListData = viewModel.chaptersForQuickJump()
+                                    showChapterList = true
+                                }
+                            }
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            state.chapter?.title ?: "",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1
+                        )
+                    }
+
+                    IconButton(onClick = {
+                        scope.launch { viewModel.nextChapterId()?.let { goToChapter(it) } }
+                    }, enabled = state.hasNext) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "الفصل التالي", tint = if (state.hasNext) Color.White else Color.White.copy(alpha = 0.3f))
+                    }
+                }
+
+                // شريط موضع القراءة داخل الفصل
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Slider(
+                        value = sliderPercent,
+                        onValueChange = {
+                            isDraggingSlider = true
+                            sliderPercent = it
+                        },
+                        onValueChangeFinished = {
+                            isDraggingSlider = false
+                            webViewRef?.evaluateJavascript(
+                                "window.scrollTo(0, Math.floor((document.scrollingElement.scrollHeight - window.innerHeight) * $sliderPercent));",
+                                null
+                            )
+                        },
+                        modifier = Modifier.weight(1f).padding(end = 8.dp),
+                        colors = SliderDefaults.colors(thumbColor = AccentPrimary, activeTrackColor = AccentPrimary)
+                    )
+                    Text(
+                        "${(sliderPercent * 100).toInt()}%",
+                        color = Color.White.copy(alpha = 0.7f),
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.width(40.dp)
+                    )
+                }
+
+                // شريط السطوع
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Filled.BrightnessLow, contentDescription = null, tint = Color.White.copy(alpha = 0.7f))
                     Slider(
@@ -300,32 +450,22 @@ fun ReaderScreen(
                         colors = SliderDefaults.colors(thumbColor = AccentPrimary, activeTrackColor = AccentPrimary)
                     )
                     Icon(Icons.Filled.BrightnessHigh, contentDescription = null, tint = Color.White.copy(alpha = 0.7f))
+                    Text(
+                        "${(if (brightness < 0f) 50 else (brightness * 100).toInt())}%",
+                        color = Color.White.copy(alpha = 0.7f),
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.width(40.dp)
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(4.dp))
 
+                // صف الأيقونات: راحة العين، إبقاء الشاشة مضاءة، قفل الاتجاه، قفل أدوات التحكم
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = {
-                        scope.launch {
-                            viewModel.previousChapterId()?.let { goToChapter(it) }
-                        }
-                    }, enabled = state.hasPrevious) {
-                        Icon(Icons.Filled.ArrowForward, contentDescription = "الفصل السابق", tint = if (state.hasPrevious) Color.White else Color.White.copy(alpha = 0.3f))
-                    }
-
-                    IconButton(onClick = {
-                        scope.launch {
-                            chapterListData = viewModel.chaptersForQuickJump()
-                            showChapterList = true
-                        }
-                    }) {
-                        Icon(Icons.Filled.List, contentDescription = "قائمة الفصول", tint = Color.White)
-                    }
-
                     IconButton(onClick = { viewModel.setEyeComfort(!eyeComfort) }) {
                         Icon(
                             Icons.Filled.Visibility,
@@ -351,19 +491,35 @@ fun ReaderScreen(
                     }
 
                     IconButton(onClick = {
-                        scope.launch {
-                            viewModel.nextChapterId()?.let { goToChapter(it) }
-                        }
-                    }, enabled = state.hasNext) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = "الفصل التالي", tint = if (state.hasNext) Color.White else Color.White.copy(alpha = 0.3f))
+                        isLocked = true
+                        viewModel.setControlsVisible(false)
+                    }) {
+                        Icon(Icons.Filled.Lock, contentDescription = "قفل أدوات التحكم", tint = Color.White)
                     }
                 }
             }
         }
 
+        // ───── تلميح فتح القفل: يظهر عند الضغط على الشاشة وهي مقفلة ─────
+        AnimatedVisibility(
+            visible = isLocked && showUnlockHint,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.Center)
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 20.dp, vertical = 14.dp)
+            ) {
+                Icon(Icons.Filled.LockOpen, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
+                Spacer(modifier = Modifier.height(6.dp))
+                Text("اضغط مرة أخرى لإلغاء القفل", color = Color.White, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+
         // ───── فاصل بسيط وغير قابل للضغط بين الفصلين، يظهر وينتقل تلقائياً ─────
-        // لا يوجد هنا أي زر "الفصل التالي" يحتاج ضغطاً، ولا يُظهر أي شريط تحكم؛
-        // فقط خط رفيع بالمنتصف مكتوب فيه الوقت الذي قُضي في الفصل، ثم يتابع القارئ تلقائياً.
         AnimatedVisibility(
             visible = state.transition != null,
             enter = fadeIn(),
@@ -372,7 +528,15 @@ fun ReaderScreen(
         ) {
             val transition = state.transition
             if (transition != null) {
-                ChapterDivider(transition = transition)
+                ChapterDivider(
+                    transition = transition,
+                    onSkipNow = {
+                        scope.launch {
+                            val nextId = viewModel.nextChapterId()
+                            if (nextId != null) goToChapter(nextId)
+                        }
+                    }
+                )
             }
         }
     }
@@ -392,33 +556,41 @@ fun ReaderScreen(
 }
 
 @Composable
-private fun ChapterDivider(transition: ChapterTransition) {
+private fun ChapterDivider(transition: ChapterTransition, onSkipNow: () -> Unit) {
     val minutes = transition.elapsedSeconds / 60
     val seconds = transition.elapsedSeconds % 60
-    val timeText = if (minutes > 0) "${minutes} د ${seconds} ث" else "${seconds} ث"
+    val timeText = if (minutes > 0) "${minutes} د ${seconds} ث" else "أقل من دقيقة"
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             HorizontalDividerLine()
             Column(
                 modifier = Modifier
-                    .background(Color(0xCC1C1726), shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                    .background(Color(0xCC1C1726), shape = RoundedCornerShape(14.dp))
+                    .padding(horizontal = 18.dp, vertical = 12.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Icon(Icons.Filled.Schedule, contentDescription = null, tint = Color.White.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.height(2.dp))
+                Icon(Icons.Filled.Schedule, contentDescription = null, tint = AccentPrimary, modifier = Modifier.size(22.dp))
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     "قضيت $timeText في هذا الفصل",
                     color = Color.White.copy(alpha = 0.85f),
                     style = MaterialTheme.typography.bodySmall
                 )
+                Spacer(modifier = Modifier.height(8.dp))
                 if (!transition.isLastChapter) {
-                    Text(
-                        "...جاري الانتقال للفصل التالي",
-                        color = Color.White.copy(alpha = 0.5f),
-                        style = MaterialTheme.typography.labelSmall
-                    )
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(AccentPrimary.copy(alpha = 0.2f))
+                            .clickable(onClick = onSkipNow)
+                            .padding(horizontal = 14.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.MenuBook, contentDescription = null, tint = AccentPrimary, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("الفصل التالي", color = AccentPrimary, style = MaterialTheme.typography.labelSmall)
+                    }
                 } else {
                     Text(
                         "هذا آخر فصل متوفر",
