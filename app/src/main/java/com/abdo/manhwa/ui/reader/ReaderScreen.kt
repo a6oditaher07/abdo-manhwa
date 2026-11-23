@@ -2,6 +2,7 @@ package com.abdo.manhwa.ui.reader
 
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
+import android.net.Uri
 import android.view.WindowManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -25,6 +26,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
@@ -37,7 +39,9 @@ import com.abdo.manhwa.ui.theme.AccentPrimary
 import com.abdo.manhwa.util.findActivity
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.io.File
+import java.util.Locale
 
 @SuppressLint("SetJavaScriptEnabled")
 @OptIn(ExperimentalMaterial3Api::class)
@@ -54,10 +58,6 @@ fun ReaderScreen(
     val view = LocalView.current
     val scope = rememberCoroutineScope()
 
-    // الفصل الحالي يُدار داخلياً (بدون التنقل عبر NavController) حتى لا تُعاد بناء الشاشة
-    // بالكامل عند كل انتقال بين الفصول — هذا كان يسبب ظهور الأشرطة وتغيّر السطوع فجأة سابقاً.
-    var currentChapterId by remember { mutableStateOf(chapterId) }
-
     val state by viewModel.state.collectAsState()
     val brightness by viewModel.brightness.collectAsState(initial = -1f)
     val eyeComfort by viewModel.eyeComfort.collectAsState(initial = false)
@@ -73,15 +73,45 @@ fun ReaderScreen(
     var isLocked by remember { mutableStateOf(false) }
     var showUnlockHint by remember { mutableStateOf(false) }
 
-    // ───── شريط تمرير الموضع داخل الفصل (نسبة مئوية) ─────
+    // ───── شريط تمرير الموضع داخل الفصل الظاهر (نسبة مئوية) ─────
     var sliderPercent by remember { mutableStateOf(0f) }
     var isDraggingSlider by remember { mutableStateOf(false) }
 
     val barsVisible = state.controlsVisible && !isLocked
 
+    // لون التمييز يُمرَّر لصفحة الويب لتلوين الفاصل بين الفصول
+    val accentHex = remember { String.format(Locale.US, "#%06X", 0xFFFFFF and AccentPrimary.toArgb()) }
+
+    /** يحمّل الفصل التالي مسبقاً ويضيفه أسفل الفصل الأخير داخل نفس صفحة التمرير */
+    fun appendNext(lastChapterId: Long) {
+        val wv = webViewRef ?: return
+        val next = viewModel.nextExistingChapter(lastChapterId)
+        if (next == null) {
+            wv.evaluateJavascript("window.__abdoNoMore && window.__abdoNoMore();", null)
+        } else {
+            val url = Uri.fromFile(File(next.filePath)).toString()
+            wv.evaluateJavascript(
+                "window.__abdoAppend && window.__abdoAppend(" +
+                    "${next.id}, ${JSONObject.quote(next.title)}, ${JSONObject.quote(url)});",
+                null
+            )
+        }
+    }
+
+    /**
+     * الانتقال إلى فصل: إن كان موجوداً في السلسلة المتصلة نقفز إليه فوراً بلا إعادة تحميل،
+     * وإلا نبدأ سلسلة جديدة من ذلك الفصل.
+     */
     fun goToChapter(id: Long) {
         loadError = false
-        currentChapterId = id
+        val wv = webViewRef
+        if (wv == null) {
+            viewModel.loadChapter(mangaId, id)
+            return
+        }
+        wv.evaluateJavascript("window.__abdoGoto ? window.__abdoGoto($id) : false") { result ->
+            if (result != "true") viewModel.loadChapter(mangaId, id)
+        }
     }
 
     fun handleCenterTap() {
@@ -101,8 +131,25 @@ fun ReaderScreen(
         }
     }
 
-    LaunchedEffect(currentChapterId) {
-        viewModel.loadChapter(mangaId, currentChapterId)
+    val bridge = remember {
+        ReaderJsBridge(
+            onVisible = { id -> viewModel.onChapterVisible(id) },
+            onProgress = { id, percent ->
+                if (id == viewModel.state.value.chapter?.id && !isDraggingSlider) sliderPercent = percent
+                viewModel.reportProgress(id, percent)
+            },
+            onFinished = { id -> viewModel.onChapterFinished(id) },
+            onNeedNext = { lastId -> appendNext(lastId) },
+            chapterPathProvider = { id -> viewModel.chapterPath(id) }
+        )
+    }
+
+    LaunchedEffect(mangaId, chapterId) {
+        viewModel.loadChapter(mangaId, chapterId)
+    }
+
+    // عند أي تحميل كامل جديد يرجع شريط الموضع للبداية
+    LaunchedEffect(state.loadToken) {
         sliderPercent = 0f
     }
 
@@ -161,70 +208,24 @@ fun ReaderScreen(
         }
     }
 
-    // ───── حفظ تلقائي لموضع القراءة كل بضع ثوانٍ، واكتشاف نهاية الفصل ─────
-    LaunchedEffect(state.chapter?.id) {
-        val wv = webViewRef
-        if (wv == null || state.chapter == null) return@LaunchedEffect
+    // ───── حفظ دوري لآخر موضع قراءة (احتياط في حال توقّف التمرير قبل انقضاء مهلة الحفظ) ─────
+    LaunchedEffect(Unit) {
         while (true) {
             delay(4000)
-            readScrollPercent(wv) { percent ->
-                if (percent != null) {
-                    viewModel.saveProgress(percent)
-                    if (percent >= 0.97f && state.transition == null) {
-                        viewModel.onReachedEnd()
-                    }
-                }
-            }
-        }
-    }
-
-    // ───── تحديث شريط التمرير المرئي بموضع القراءة الحالي (فقط أثناء ظهور الأشرطة ومن غير سحب يدوي) ─────
-    LaunchedEffect(state.chapter?.id, barsVisible) {
-        if (!barsVisible) return@LaunchedEffect
-        val wv = webViewRef ?: return@LaunchedEffect
-        while (true) {
-            if (!isDraggingSlider) {
-                readScrollPercent(wv) { percent -> if (percent != null) sliderPercent = percent }
-            }
-            delay(600)
+            viewModel.flushProgress()
         }
     }
 
     // ───── حفظ عند الخروج من الشاشة ─────
-    DisposableEffect(state.chapter?.id) {
-        onDispose {
-            val wv = webViewRef
-            if (wv != null) {
-                readScrollPercent(wv) { percent ->
-                    if (percent != null) viewModel.saveProgress(percent)
-                }
-            }
-        }
-    }
-
-    // ───── الانتقال التلقائي للفصل التالي بعد ظهور الفاصل البسيط بينهما ─────
-    LaunchedEffect(state.transition) {
-        val transition = state.transition ?: return@LaunchedEffect
-        val originChapterId = state.chapter?.id
-        if (transition.isLastChapter) return@LaunchedEffect
-        delay(1400) // مدة ظهور الفاصل قبل المتابعة التلقائية
-        // تأكد أن المستخدم ما انتقل يدوياً بالفعل أثناء الانتظار (مثل الضغط على زر "الفصل التالي")
-        if (viewModel.state.value.chapter?.id == originChapterId) {
-            val nextId = viewModel.nextChapterId()
-            if (nextId != null) {
-                goToChapter(nextId)
-            } else {
-                viewModel.clearTransition()
-            }
-        }
+    DisposableEffect(Unit) {
+        onDispose { viewModel.flushProgress() }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
 
         when {
             state.fileMissing -> ReaderErrorContent(onBack = onBack)
-            state.chapter != null -> {
-                val chapterPath = state.chapter!!.filePath
+            state.startChapter != null -> {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
@@ -242,18 +243,19 @@ fun ReaderScreen(
                             settings.setSupportZoom(true)
                             settings.builtInZoomControls = true
                             settings.displayZoomControls = false
+                            addJavascriptInterface(bridge, "AbdoReader")
                             webViewClient = object : WebViewClient() {
                                 override fun onPageFinished(view: WebView, url: String?) {
                                     super.onPageFinished(view, url)
-                                    val targetPercent = state.chapter?.scrollPercent ?: 0f
-                                    if (targetPercent > 0f) {
-                                        view.postDelayed({
-                                            view.evaluateJavascript(
-                                                "window.scrollTo(0, Math.floor((document.scrollingElement.scrollHeight - window.innerHeight) * $targetPercent));",
-                                                null
-                                            )
-                                        }, 250)
-                                    }
+                                    val start = viewModel.state.value.startChapter ?: return
+                                    // فصل أُنهي سابقاً يُفتح من بدايته بدل نهايته
+                                    val restore = if (start.scrollPercent >= 0.97f) 0f else start.scrollPercent
+                                    view.evaluateJavascript(ReaderRuntime.SCRIPT, null)
+                                    view.evaluateJavascript(
+                                        "window.__abdoInit(${start.id}, ${JSONObject.quote(start.title)}, " +
+                                            "$restore, ${JSONObject.quote(accentHex)});",
+                                        null
+                                    )
                                 }
 
                                 override fun onReceivedError(
@@ -266,13 +268,17 @@ fun ReaderScreen(
                                 }
                             }
                             webViewRef = this
-                            loadUrl("file://" + File(chapterPath).absolutePath)
+                            tag = state.loadToken
+                            loadUrl("file://" + File(state.startChapter!!.filePath).absolutePath)
                         }
                     },
                     update = { wv ->
-                        if (!wv.url.orEmpty().endsWith(File(chapterPath).name)) {
+                        // تحميل جديد كامل فقط عند قفزة إلى فصل خارج السلسلة المتصلة الحالية
+                        val start = state.startChapter
+                        if (start != null && wv.tag != state.loadToken) {
+                            wv.tag = state.loadToken
                             loadError = false
-                            wv.loadUrl("file://" + File(chapterPath).absolutePath)
+                            wv.loadUrl("file://" + File(start.filePath).absolutePath)
                         }
                     }
                 )
@@ -320,7 +326,7 @@ fun ReaderScreen(
                     Text(state.chapter?.title ?: "", color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodySmall)
                 }
                 IconButton(onClick = {
-                    scope.launch { viewModel.nextChapterId()?.let { goToChapter(it) } }
+                    viewModel.nextChapterId()?.let { goToChapter(it) }
                 }, enabled = state.hasNext) {
                     Icon(
                         Icons.Filled.ChevronRight,
@@ -381,7 +387,7 @@ fun ReaderScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = {
-                        scope.launch { viewModel.previousChapterId()?.let { goToChapter(it) } }
+                        viewModel.previousChapterId()?.let { goToChapter(it) }
                     }, enabled = state.hasPrevious) {
                         Icon(Icons.Filled.ArrowForward, contentDescription = "الفصل السابق", tint = if (state.hasPrevious) Color.White else Color.White.copy(alpha = 0.3f))
                     }
@@ -408,7 +414,7 @@ fun ReaderScreen(
                     }
 
                     IconButton(onClick = {
-                        scope.launch { viewModel.nextChapterId()?.let { goToChapter(it) } }
+                        viewModel.nextChapterId()?.let { goToChapter(it) }
                     }, enabled = state.hasNext) {
                         Icon(Icons.Filled.ArrowBack, contentDescription = "الفصل التالي", tint = if (state.hasNext) Color.White else Color.White.copy(alpha = 0.3f))
                     }
@@ -424,10 +430,13 @@ fun ReaderScreen(
                         },
                         onValueChangeFinished = {
                             isDraggingSlider = false
-                            webViewRef?.evaluateJavascript(
-                                "window.scrollTo(0, Math.floor((document.scrollingElement.scrollHeight - window.innerHeight) * $sliderPercent));",
-                                null
-                            )
+                            val visibleId = state.chapter?.id
+                            if (visibleId != null) {
+                                webViewRef?.evaluateJavascript(
+                                    "window.__abdoSeek && window.__abdoSeek($visibleId, $sliderPercent);",
+                                    null
+                                )
+                            }
                         },
                         modifier = Modifier.weight(1f).padding(end = 8.dp),
                         colors = SliderDefaults.colors(thumbColor = AccentPrimary, activeTrackColor = AccentPrimary)
@@ -518,27 +527,6 @@ fun ReaderScreen(
                 Text("اضغط مرة أخرى لإلغاء القفل", color = Color.White, style = MaterialTheme.typography.bodySmall)
             }
         }
-
-        // ───── فاصل بسيط وغير قابل للضغط بين الفصلين، يظهر وينتقل تلقائياً ─────
-        AnimatedVisibility(
-            visible = state.transition != null,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier.align(Alignment.Center)
-        ) {
-            val transition = state.transition
-            if (transition != null) {
-                ChapterDivider(
-                    transition = transition,
-                    onSkipNow = {
-                        scope.launch {
-                            val nextId = viewModel.nextChapterId()
-                            if (nextId != null) goToChapter(nextId)
-                        }
-                    }
-                )
-            }
-        }
     }
 
     if (showChapterList) {
@@ -553,65 +541,6 @@ fun ReaderScreen(
             )
         }
     }
-}
-
-@Composable
-private fun ChapterDivider(transition: ChapterTransition, onSkipNow: () -> Unit) {
-    val minutes = transition.elapsedSeconds / 60
-    val seconds = transition.elapsedSeconds % 60
-    val timeText = if (minutes > 0) "${minutes} د ${seconds} ث" else "أقل من دقيقة"
-
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            HorizontalDividerLine()
-            Column(
-                modifier = Modifier
-                    .background(Color(0xCC1C1726), shape = RoundedCornerShape(14.dp))
-                    .padding(horizontal = 18.dp, vertical = 12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Icon(Icons.Filled.Schedule, contentDescription = null, tint = AccentPrimary, modifier = Modifier.size(22.dp))
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    "قضيت $timeText في هذا الفصل",
-                    color = Color.White.copy(alpha = 0.85f),
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                if (!transition.isLastChapter) {
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(AccentPrimary.copy(alpha = 0.2f))
-                            .clickable(onClick = onSkipNow)
-                            .padding(horizontal = 14.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Filled.MenuBook, contentDescription = null, tint = AccentPrimary, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("الفصل التالي", color = AccentPrimary, style = MaterialTheme.typography.labelSmall)
-                    }
-                } else {
-                    Text(
-                        "هذا آخر فصل متوفر",
-                        color = Color.White.copy(alpha = 0.5f),
-                        style = MaterialTheme.typography.labelSmall
-                    )
-                }
-            }
-            HorizontalDividerLine()
-        }
-    }
-}
-
-@Composable
-private fun HorizontalDividerLine() {
-    Box(
-        modifier = Modifier
-            .width(28.dp)
-            .height(1.dp)
-            .background(Color.White.copy(alpha = 0.25f))
-    )
 }
 
 @Composable
@@ -647,15 +576,5 @@ private fun ReaderErrorContent(onBack: () -> Unit) {
                 Text("رجوع")
             }
         }
-    }
-}
-
-/** يقرأ نسبة التمرير الحالية من صفحة الـ WebView عبر JavaScript */
-private fun readScrollPercent(webView: WebView, onResult: (Float?) -> Unit) {
-    webView.evaluateJavascript(
-        "(function(){try{var d=document.scrollingElement;var max=d.scrollHeight-window.innerHeight;if(max<=0)return 1;return Math.min(1, Math.max(0, d.scrollTop/max));}catch(e){return -1}})();"
-    ) { result ->
-        val value = result?.toFloatOrNull()
-        onResult(if (value == null || value < 0f) null else value)
     }
 }
