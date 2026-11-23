@@ -11,7 +11,7 @@ import com.abdo.manhwa.data.local.entity.MangaEntity
 
 @Database(
     entities = [MangaEntity::class, ChapterEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
