@@ -124,6 +124,10 @@ class MangaRepository(context: Context) {
         mangaDao.update(updated)
     }
 
+    suspend fun toggleFavorite(manga: MangaEntity) = withContext(Dispatchers.IO) {
+        mangaDao.update(manga.copy(isFavorite = !manga.isFavorite))
+    }
+
     suspend fun deleteManga(manga: MangaEntity) = withContext(Dispatchers.IO) {
         mangaDao.delete(manga)
         fileStorage.deleteMangaFolder(fileStorage.folderNameFor(manga.id))
