@@ -97,6 +97,13 @@ class ReaderViewModel(
         _state.update { it.copy(transition = null) }
     }
 
+    /** يبدّل حالة المفضّلة لهذه المانهوا (تحديث فوري في الواجهة + حفظ في قاعدة البيانات) */
+    fun toggleFavorite() {
+        val manga = _state.value.manga ?: return
+        _state.update { it.copy(manga = manga.copy(isFavorite = !manga.isFavorite)) }
+        viewModelScope.launch { repository.toggleFavorite(manga) }
+    }
+
     fun saveProgress(scrollPercent: Float) {
         val chapter = _state.value.chapter ?: return
         if (mangaId <= 0) return
