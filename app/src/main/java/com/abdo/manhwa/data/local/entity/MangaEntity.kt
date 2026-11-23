@@ -18,5 +18,6 @@ data class MangaEntity(
     val createdAt: Long = System.currentTimeMillis(),
     val lastReadChapterId: Long? = null,
     val lastReadScrollPercent: Float = 0f,
-    val lastReadAt: Long = 0L
+    val lastReadAt: Long = 0L,
+    val isFavorite: Boolean = false
 )
