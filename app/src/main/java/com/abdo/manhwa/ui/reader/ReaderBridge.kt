@@ -157,7 +157,18 @@ object ReaderRuntime {
     }
   }
 
-  function buildNodes(doc, skipStyles) {
+  function absolutize(root, base) {
+    if (!root || root.nodeType !== 1 || !base) return;
+    var imgs = root.nodeName === 'IMG' ? [root] : root.querySelectorAll('img');
+    for (var i = 0; i < imgs.length; i++) {
+      var s = imgs[i].getAttribute('src');
+      if (s && !/^(data:|blob:|[a-z][a-z0-9+.\-]*:|\/\/)/i.test(s)) {
+        try { imgs[i].setAttribute('src', new URL(s, base).href); } catch (e) {}
+      }
+    }
+  }
+
+  function buildNodes(doc, skipStyles, base) {
     var body = doc && doc.body;
     if (!body) return [];
     try {
@@ -171,6 +182,7 @@ object ReaderRuntime {
       if (skipStyles && n.nodeType === 1 && (n.nodeName === 'STYLE' || n.nodeName === 'LINK' || n.nodeName === 'META')) continue;
       var imp = document.importNode(n, true);
       fixLazy(imp);
+      absolutize(imp, base);
       out.push(imp);
     }
     return out;
@@ -228,7 +240,7 @@ object ReaderRuntime {
     fetchDoc(c.url, c.id, function (doc) {
       busy[c.id] = false;
       if (!doc || !c.trimmed || !c.ph) return;
-      var nodes = buildNodes(doc, true);
+      var nodes = buildNodes(doc, true, c.url);
       var ph = c.ph;
       var parent = ph.parentNode;
       for (var k = 0; k < nodes.length; k++) parent.insertBefore(nodes[k], ph);
@@ -377,7 +389,7 @@ object ReaderRuntime {
     fetchDoc(url, id, function (doc) {
       if (!doc || !doc.body) { pending = false; renderTail(false); return; }
       if (findIdx(id) >= 0) return;
-      var nodes = buildNodes(doc, false);
+      var nodes = buildNodes(doc, false, url);
       var div = makeDivider(title);
       prev.endEl = div;
       prev.timeEl = div.querySelector('.abdo-time');
