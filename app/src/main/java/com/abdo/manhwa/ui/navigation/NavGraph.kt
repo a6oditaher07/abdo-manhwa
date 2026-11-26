@@ -1,6 +1,8 @@
 package com.abdo.manhwa.ui.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.runtime.CompositionLocalProvider
@@ -12,8 +14,11 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.abdo.manhwa.data.datastore.SettingsDataStore
 import com.abdo.manhwa.data.repository.MangaRepository
+import com.abdo.manhwa.download.DownloadCenter
+import com.abdo.manhwa.util.findActivity
 import com.abdo.manhwa.ui.addmanga.AddMangaScreen
 import com.abdo.manhwa.ui.addmanga.AddMangaViewModel
+import com.abdo.manhwa.ui.browser.BrowserScreen
 import com.abdo.manhwa.ui.common.AppViewModelFactory
 import com.abdo.manhwa.ui.detail.DetailScreen
 import com.abdo.manhwa.ui.detail.DetailViewModel
@@ -23,12 +28,22 @@ import com.abdo.manhwa.ui.reader.ReaderScreen
 import com.abdo.manhwa.ui.reader.ReaderViewModel
 import com.abdo.manhwa.ui.splash.SplashScreen
 
+private const val BROWSER_ROUTE = "browser"
+
 /** الرسم البياني الرئيسي للتنقل بين كل شاشات التطبيق، بدعم كامل لاتجاه RTL */
 @Composable
 fun AbdoManhwaNavHost(
     repository: MangaRepository,
     settingsDataStore: SettingsDataStore
 ) {
+    // مركز التحميل يحتاج النشاط الحالي لاستضافة صفحة الفحص المخفية عند تحميل الفصول
+    val hostContext = LocalContext.current
+    DisposableEffect(Unit) {
+        DownloadCenter.init(hostContext.applicationContext)
+        DownloadCenter.setHost(hostContext.findActivity())
+        onDispose { DownloadCenter.setHost(null) }
+    }
+
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         val navController = rememberNavController()
 
@@ -53,8 +68,13 @@ fun AbdoManhwaNavHost(
                         navController.navigate(Screen.Reader.createRoute(mangaId, chapterId))
                     },
                     onAddManga = { navController.navigate(Screen.AddManga.createRoute()) },
-                    onEditManga = { mangaId -> navController.navigate(Screen.AddManga.createRoute(mangaId)) }
+                    onEditManga = { mangaId -> navController.navigate(Screen.AddManga.createRoute(mangaId)) },
+                    onOpenBrowser = { navController.navigate(BROWSER_ROUTE) }
                 )
+            }
+
+            composable(BROWSER_ROUTE) {
+                BrowserScreen(onBack = { navController.popBackStack() })
             }
 
             composable(
