@@ -8,7 +8,13 @@ import com.abdo.manhwa.data.local.entity.MangaEntity
 import com.abdo.manhwa.util.NaturalOrderComparator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import java.io.File
 import kotlinx.coroutines.withContext
+
+/** مفتاح مقارنة موحّد للعناوين (يتجاهل المسافات الزائدة وحالة الأحرف) */
+fun normalizeTitleKey(title: String): String =
+    title.trim().replace(Regex("\\s+"), " ").lowercase()
 
 /** عنصر وسيط يمثل فصلاً تم اختياره في شاشة الإضافة قبل التأكيد والحفظ النهائي */
 data class PickedChapter(
@@ -158,4 +164,68 @@ class MangaRepository(context: Context) {
     }
 
     fun chapterFileExists(path: String?) = fileStorage.fileExists(path)
+
+    // ───────────────────────── استيراد الفصول المحمّلة من الإنترنت ─────────────────────────
+
+    suspend fun findMangaByTitle(title: String): MangaEntity? = withContext(Dispatchers.IO) {
+        findByTitleInternal(title)
+    }
+
+    private suspend fun findByTitleInternal(title: String): MangaEntity? {
+        val key = normalizeTitleKey(title)
+        return mangaDao.observeAll().first().firstOrNull { normalizeTitleKey(it.title) == key }
+    }
+
+    /** عناوين الفصول الموجودة فعلاً في المكتبة لمانهوا بهذا الاسم (فارغة إن لم توجد المانهوا) */
+    suspend fun downloadedChapterKeys(mangaTitle: String): Set<String> = withContext(Dispatchers.IO) {
+        val manga = findByTitleInternal(mangaTitle) ?: return@withContext emptySet()
+        chapterDao.getByManga(manga.id).map { normalizeTitleKey(it.title) }.toSet()
+    }
+
+    /**
+     * يضيف فصلاً محمّلاً إلى المكتبة: ينشئ المانهوا (بغلافها ونبذتها) إن لم تكن موجودة،
+     * وينقل مجلد الفصل إلى مجلد المانهوا، ثم يعيد ترتيب الفصول ترتيباً طبيعياً.
+     * يُعيد معرّف المانهوا.
+     */
+    suspend fun importDownloadedChapter(
+        mangaTitle: String,
+        description: String,
+        coverFile: File?,
+        chapterTitle: String,
+        stagingDir: File,
+        dirName: String
+    ): Long = withContext(Dispatchers.IO) {
+        val existing = findByTitleInternal(mangaTitle)
+        val mangaId = existing?.id ?: mangaDao.insert(
+            MangaEntity(title = mangaTitle.trim(), description = description, coverPath = null)
+        )
+        val folder = fileStorage.folderNameFor(mangaId)
+
+        if (coverFile != null && existing?.coverPath == null) {
+            val coverPath = fileStorage.copyCoverFile(folder, coverFile)
+            if (coverPath != null) {
+                mangaDao.getById(mangaId)?.let { mangaDao.update(it.copy(coverPath = coverPath)) }
+            }
+        }
+
+        val target = fileStorage.importChapterDirectory(folder, stagingDir, dirName)
+            ?: throw IllegalStateException("تعذّر حفظ مجلد الفصل")
+        val htmlPath = File(target, "index.html").absolutePath
+
+        val chapters = chapterDao.getByManga(mangaId)
+        val duplicate = chapters.firstOrNull { normalizeTitleKey(it.title) == normalizeTitleKey(chapterTitle) }
+        if (duplicate != null) {
+            // الفصل موجود (مثلاً نسخة SingleFile قديمة): نستبدل مساره بالنسخة المحمّلة
+            chapterDao.update(duplicate.copy(filePath = htmlPath))
+        } else {
+            val nextIndex = (chapters.maxOfOrNull { it.orderIndex } ?: -1) + 1
+            chapterDao.insertAll(
+                listOf(ChapterEntity(mangaId = mangaId, title = chapterTitle, filePath = htmlPath, orderIndex = nextIndex))
+            )
+            val sorted = chapterDao.getByManga(mangaId)
+                .sortedWith(compareBy(NaturalOrderComparator) { it.title })
+            chapterDao.updateAll(sorted.mapIndexed { index, c -> c.copy(orderIndex = index) })
+        }
+        mangaId
+    }
 }
