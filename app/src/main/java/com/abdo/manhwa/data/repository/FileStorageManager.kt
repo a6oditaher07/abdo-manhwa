@@ -67,6 +67,42 @@ class FileStorageManager(private val context: Context) {
         }
     }
 
+    /** مجلد مؤقت لفصل قيد التحميل (قبل ضمّه إلى مجلد المانهوا عند اكتماله) */
+    fun downloadsStagingDir(key: String): File {
+        val root = File(context.filesDir, "manhwa_dl")
+        if (!root.exists()) root.mkdirs()
+        return File(root, key)
+    }
+
+    /** ينقل مجلد فصل محمّل (صور + index.html) إلى مجلد المانهوا ويُعيد المجلد الجديد */
+    fun importChapterDirectory(mangaFolderName: String, stagingDir: File, dirName: String): File? {
+        return try {
+            val chaptersDir = File(mangaDir(mangaFolderName), "chapters")
+            if (!chaptersDir.exists()) chaptersDir.mkdirs()
+            val target = File(chaptersDir, dirName)
+            if (target.exists()) target.deleteRecursively()
+            if (!stagingDir.renameTo(target)) {
+                stagingDir.copyRecursively(target, overwrite = true)
+                stagingDir.deleteRecursively()
+            }
+            if (target.exists()) target else null
+        } catch (e: IOException) {
+            null
+        }
+    }
+
+    /** ينسخ ملف غلاف موجود مسبقاً (مثل غلاف حُمّل من الإنترنت) إلى مجلد المانهوا */
+    fun copyCoverFile(mangaFolderName: String, source: File): String? {
+        return try {
+            val ext = source.extension.ifBlank { "jpg" }
+            val dest = File(mangaDir(mangaFolderName), "cover.$ext")
+            source.copyTo(dest, overwrite = true)
+            dest.absolutePath
+        } catch (e: IOException) {
+            null
+        }
+    }
+
     fun deleteMangaFolder(mangaFolderName: String) {
         mangaDir(mangaFolderName).deleteRecursively()
     }
