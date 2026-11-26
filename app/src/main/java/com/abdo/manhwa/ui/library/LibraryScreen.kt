@@ -8,6 +8,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PostAdd
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
@@ -29,7 +30,8 @@ fun LibraryScreen(
     onOpenDetail: (Long) -> Unit,
     onContinueReading: (Long, Long) -> Unit,
     onAddManga: () -> Unit,
-    onEditManga: (Long) -> Unit
+    onEditManga: (Long) -> Unit,
+    onOpenBrowser: () -> Unit = {}
 ) {
     val uiState by viewModel.uiState.collectAsState()
     var longPressedItem by remember { mutableStateOf<LibraryItemUi?>(null) }
@@ -47,6 +49,11 @@ fun LibraryScreen(
 
             TopAppBar(
                 title = { Text("مكتبتي", color = Color.White) },
+                actions = {
+                    IconButton(onClick = onOpenBrowser) {
+                        Icon(Icons.Filled.Language, contentDescription = "المتصفح وتحميل الفصول", tint = Color.White)
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = BackgroundDark)
             )
 
