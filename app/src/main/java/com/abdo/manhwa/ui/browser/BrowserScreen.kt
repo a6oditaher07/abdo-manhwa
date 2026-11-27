@@ -32,6 +32,7 @@ import com.abdo.manhwa.download.DlRequest
 import com.abdo.manhwa.download.DlStatus
 import com.abdo.manhwa.download.DlTask
 import com.abdo.manhwa.download.DownloadCenter
+import com.abdo.manhwa.download.QuickResult
 import com.abdo.manhwa.download.ScanChapter
 import com.abdo.manhwa.download.ScanResult
 import com.abdo.manhwa.download.SiteScripts
@@ -45,6 +46,18 @@ private fun normalizeUrl(input: String): String {
     if (t.isEmpty()) return ""
     return if (t.contains("://")) t else "https://$t"
 }
+
+/** رابط الفصل بدون الجزء بعد # حتى يكون مفتاحاً ثابتاً للتحميل */
+private fun chapterKey(url: String): String = url.substringBefore('#')
+
+/** بيانات فصل مفتوح أمامك قبل بدء تحميله */
+private data class ReaderDraft(
+    val quick: QuickResult,
+    val mangaName: String,
+    val chapterName: String,
+    val coverUrl: String?,
+    val description: String
+)
 
 @SuppressLint("SetJavaScriptEnabled")
 @OptIn(ExperimentalMaterial3Api::class)
@@ -60,6 +73,12 @@ fun BrowserScreen(onBack: () -> Unit) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
     var scan by remember { mutableStateOf<ScanResult?>(null) }
+    // آخر صفحة مانهوا فُحصت فيها قائمة فصول (تبقى بعد الدخول إلى فصل لمعرفة اسم المانهوا والغلاف والنبذة)
+    var remembered by remember { mutableStateOf<ScanResult?>(null) }
+    // نتيجة قراءة صور الفصل المفتوح حالياً
+    var quick by remember { mutableStateOf<QuickResult?>(null) }
+    var draft by remember { mutableStateOf<ReaderDraft?>(null) }
+    val snackbarHost = remember { SnackbarHostState() }
     var showSheet by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
     var showHomeDialog by remember { mutableStateOf(homeUrl.isEmpty()) }
@@ -83,8 +102,88 @@ fun BrowserScreen(onBack: () -> Unit) {
             if (afterMs > 0) delay(afterMs)
             webView?.evaluateJavascript(SiteScripts.SCAN) { raw ->
                 val result = ScanResult.parse(raw)
-                if (result != null) scan = result
+                if (result != null) {
+                    scan = result
+                    if (result.chapters.isNotEmpty()) remembered = result
+                }
             }
+        }
+    }
+
+    /** يقرأ صور الفصل المفتوح بالترتيب دون تمرير الصفحة (لا يعرض ولا يكشف أي صورة) */
+    fun quickPage(afterMs: Long = 0L) {
+        scope.launch {
+            if (afterMs > 0) delay(afterMs)
+            webView?.evaluateJavascript(SiteScripts.QUICK) { raw ->
+                val result = QuickResult.parse(raw)
+                if (result != null) quick = result
+            }
+        }
+    }
+
+    fun startDownload(d: ReaderDraft) {
+        d.quick.mangaUrl?.let { prefs.edit().putString("name:" + it, d.mangaName).apply() }
+        DownloadCenter.enqueue(
+            listOf(
+                DlRequest(
+                    mangaTitle = d.mangaName,
+                    mangaDescription = d.description,
+                    coverUrl = d.coverUrl,
+                    chapterTitle = d.chapterName,
+                    chapterUrl = chapterKey(d.quick.page),
+                    mangaUrl = d.quick.mangaUrl,
+                    // إن كانت قائمة الصور كاملة نعتمدها مباشرة، وإلا يفحص التطبيق الفصل في صفحة مخفية
+                    imageUrls = if (d.quick.isComplete) d.quick.urls else null
+                )
+            )
+        )
+        Toast.makeText(context, "بدأ تحميل ${d.chapterName}", Toast.LENGTH_SHORT).show()
+    }
+
+    /** زر «تحميل هذا الفصل»: يقرأ الصور فوراً ثم يبدأ التحميل (يسأل عن الاسم فقط إن لم يعرفه) */
+    fun beginDownloadHere() {
+        webView?.evaluateJavascript(SiteScripts.QUICK) { raw ->
+            val q = QuickResult.parse(raw)
+            if (q == null || q.urls.isEmpty()) {
+                Toast.makeText(context, "لم أجد صور الفصل في هذه الصفحة", Toast.LENGTH_SHORT).show()
+            } else {
+                quick = q
+                val rem = remembered
+                val known = rem?.chapters?.firstOrNull { chapterKey(it.url) == chapterKey(q.page) }
+                val savedName = q.mangaUrl?.let { prefs.getString("name:" + it, null) }
+                val mangaName = when {
+                    known != null && rem != null -> rem.title
+                    !savedName.isNullOrBlank() -> savedName
+                    else -> q.name
+                }
+                val chapterName = known?.title ?: q.chapter.ifBlank { q.name.ifBlank { "فصل" } }
+                val d = ReaderDraft(
+                    quick = q,
+                    mangaName = mangaName,
+                    chapterName = chapterName,
+                    coverUrl = if (known != null) rem?.cover else null,
+                    description = if (known != null) rem?.description.orEmpty() else ""
+                )
+                val confident = (known != null || !savedName.isNullOrBlank()) && mangaName.isNotBlank()
+                if (confident) startDownload(d) else draft = d
+            }
+        }
+    }
+
+    // إشعار عند اكتمال إضافة فصل إلى المكتبة (لا نكرر إشعار فصول اكتملت قبل فتح المتصفح)
+    val announced = remember {
+        mutableSetOf<String>().apply {
+            addAll(DownloadCenter.tasks.value.filter { it.status == DlStatus.DONE }.map { it.key })
+        }
+    }
+    LaunchedEffect(tasks) {
+        tasks.filter { it.status == DlStatus.DONE && announced.add(it.key) }.forEach { t ->
+            val result = snackbarHost.showSnackbar(
+                message = "تمت إضافة ${t.chapterTitle} إلى المكتبة",
+                actionLabel = "فتح المكتبة",
+                duration = SnackbarDuration.Short
+            )
+            if (result == SnackbarResult.ActionPerformed) onBack()
         }
     }
 
@@ -99,6 +198,7 @@ fun BrowserScreen(onBack: () -> Unit) {
 
     Scaffold(
         containerColor = BackgroundDark,
+        snackbarHost = { SnackbarHost(snackbarHost) },
         topBar = {
             Column(modifier = Modifier.statusBarsPadding()) {
                 Row(
@@ -159,8 +259,10 @@ fun BrowserScreen(onBack: () -> Unit) {
                                 leadingIcon = { Icon(Icons.Filled.BugReport, contentDescription = null) },
                                 onClick = {
                                     showMenu = false
-                                    val report = scan?.diagnostics?.ifBlank { null }
-                                        ?: "لا توجد نتيجة فحص لهذه الصفحة: ${webView?.url}"
+                                    val report = listOfNotNull(
+                                        scan?.diagnostics?.ifBlank { null },
+                                        quick?.summary
+                                    ).joinToString("\n").ifBlank { "لا توجد نتيجة فحص لهذه الصفحة: ${webView?.url}" }
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                     cm.setPrimaryClip(ClipData.newPlainText("abdo-scan", report))
                                     Toast.makeText(context, "تم نسخ تقرير الفحص", Toast.LENGTH_SHORT).show()
@@ -180,20 +282,44 @@ fun BrowserScreen(onBack: () -> Unit) {
         },
         floatingActionButton = {
             val chapters = scan?.chapters.orEmpty()
-            if (chapters.isNotEmpty() || activeCount > 0) {
+            val q = quick
+            // صفحة قراءة: صور كثيرة وليست قائمة فصول
+            val isReader = q != null && q.urls.size >= 3 && chapters.size < 8
+            val hereTask = q?.let { qq -> tasks.firstOrNull { it.key == chapterKey(qq.page) } }
+
+            val label: String? = when {
+                hereTask != null -> when (hereTask.status) {
+                    DlStatus.QUEUED -> "في الانتظار…"
+                    DlStatus.EXTRACTING -> "جارٍ تجهيز الفصل…"
+                    DlStatus.DOWNLOADING -> "جارٍ التحميل ${(hereTask.percent * 100).toInt()}%"
+                    DlStatus.PAUSED -> "متوقف ${(hereTask.percent * 100).toInt()}%"
+                    DlStatus.FAILED -> "فشل التحميل - اضغط للتفاصيل"
+                    DlStatus.DONE -> "في المكتبة ✓"
+                }
+                isReader -> "تحميل هذا الفصل"
+                chapters.isNotEmpty() -> if (activeCount > 0) "التحميلات ($activeCount)" else "تحميل الفصول (${chapters.size})"
+                activeCount > 0 -> "التحميلات ($activeCount)"
+                else -> null
+            }
+            if (label != null) {
                 ExtendedFloatingActionButton(
                     onClick = {
-                        if (chapters.isEmpty()) scanPage()
-                        showSheet = true
+                        when {
+                            hereTask == null && isReader -> beginDownloadHere()
+                            else -> {
+                                if (chapters.isEmpty() && !isReader) scanPage()
+                                showSheet = true
+                            }
+                        }
                     },
                     containerColor = AccentPrimary,
-                    icon = { Icon(Icons.Filled.Download, contentDescription = null) },
-                    text = {
-                        Text(
-                            if (activeCount > 0) "التحميلات ($activeCount)"
-                            else "تحميل الفصول (${chapters.size})"
+                    icon = {
+                        Icon(
+                            if (hereTask?.status == DlStatus.DONE) Icons.Filled.CheckCircle else Icons.Filled.Download,
+                            contentDescription = null
                         )
-                    }
+                    },
+                    text = { Text(label) }
                 )
             }
         }
@@ -219,6 +345,7 @@ fun BrowserScreen(onBack: () -> Unit) {
                         override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                             super.onPageStarted(view, url, favicon)
                             scan = null
+                            quick = null
                             if (url != null) urlText = url
                         }
 
@@ -229,6 +356,8 @@ fun BrowserScreen(onBack: () -> Unit) {
                             CookieManager.getInstance().flush()
                             scanPage(900)
                             scanPage(3500)
+                            quickPage(1200)
+                            quickPage(4000)
                         }
                     }
                     webView = this
@@ -271,6 +400,46 @@ fun BrowserScreen(onBack: () -> Unit) {
             dismissButton = {
                 TextButton(onClick = { showHomeDialog = false; if (homeUrl.isEmpty()) onBack() }) { Text("إلغاء") }
             }
+        )
+    }
+
+    draft?.let { d ->
+        var mangaName by remember(d) { mutableStateOf(d.mangaName) }
+        var chapterName by remember(d) { mutableStateOf(d.chapterName) }
+        AlertDialog(
+            onDismissRequest = { draft = null },
+            title = { Text("تحميل هذا الفصل") },
+            text = {
+                Column {
+                    Text("تأكد من الاسمين ثم اضغط تحميل. سيُحفظ الاسم وتُضاف الفصول القادمة لنفس المانهوا مباشرة.")
+                    Spacer(modifier = Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = mangaName,
+                        onValueChange = { mangaName = it },
+                        singleLine = true,
+                        label = { Text("اسم المانهوا") }
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = chapterName,
+                        onValueChange = { chapterName = it },
+                        singleLine = true,
+                        label = { Text("اسم الفصل") }
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("عدد الصور المكتشفة: ${d.quick.urls.size}", style = MaterialTheme.typography.labelSmall)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = mangaName.isNotBlank() && chapterName.isNotBlank(),
+                    onClick = {
+                        startDownload(d.copy(mangaName = mangaName.trim(), chapterName = chapterName.trim()))
+                        draft = null
+                    }
+                ) { Text("تحميل") }
+            },
+            dismissButton = { TextButton(onClick = { draft = null }) { Text("إلغاء") } }
         )
     }
 
