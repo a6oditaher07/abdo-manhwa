@@ -46,6 +46,49 @@ data class ScanResult(
     }
 }
 
+/** نتيجة قراءة صور الفصل المفتوح حالياً في المتصفح (بدون تمرير الصفحة) */
+data class QuickResult(
+    val urls: List<String>,
+    val container: String,
+    /** عدد الصور في منطقة القراءة التي لم تظهر روابطها بعد (تحميل كسول لم يكتمل) */
+    val emptySlots: Int,
+    val page: String,
+    val name: String,
+    val chapter: String,
+    val mangaUrl: String?,
+    val mangaText: String
+) {
+    /** هل القائمة كاملة بما يكفي لاعتمادها مباشرة دون فحص الفصل في صفحة مخفية؟ */
+    val isComplete: Boolean get() = urls.size >= 3 && emptySlots == 0
+
+    val summary: String
+        get() = "quick: images=${urls.size}, emptySlots=$emptySlots, container=$container, " +
+            "name=$name, chapter=$chapter, mangaUrl=$mangaUrl, first=${urls.firstOrNull()}"
+
+    companion object {
+        fun parse(raw: String?): QuickResult? {
+            if (raw.isNullOrBlank() || raw == "null") return null
+            return try {
+                val json = (JSONTokener(raw).nextValue() as? String) ?: return null
+                val o = JSONObject(json)
+                val arr = o.getJSONArray("urls")
+                QuickResult(
+                    urls = (0 until arr.length()).map { arr.getString(it) },
+                    container = o.optString("container"),
+                    emptySlots = o.optInt("emptySlots"),
+                    page = o.optString("page"),
+                    name = o.optString("name"),
+                    chapter = o.optString("chapter"),
+                    mangaUrl = o.optString("mangaUrl").ifBlank { null },
+                    mangaText = o.optString("mangaText")
+                )
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+}
+
 /** جسر JavaScript لاستقبال نتيجة جمع صور الفصل من الصفحة المخفية */
 class DlJsBridge(private val onResult: (String) -> Unit) {
     private val main = Handler(Looper.getMainLooper())
@@ -165,13 +208,11 @@ object SiteScripts {
 })()
 """
 
-    /** يمرّر الصفحة تلقائياً حتى تُحمَّل كل الصور الكسولة، ثم يرسل روابطها عبر AbdoDl.result */
+    /** للصفحة المخفية: يمرّر الصفحة تلقائياً حتى تظهر كل الصور الكسولة، ثم يرسل روابطها عبر AbdoDl.result */
     const val COLLECT = """
 (function () {
-  if (window.__abdoCollecting) return;
-  window.__abdoCollecting = true;
-  var BR = window.AbdoDl;
   function abs(u) { try { return new URL(u, location.href).href; } catch (e) { return ''; } }
+  function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
   function depthOf(el) { var d = 0; while (el) { d++; el = el.parentElement; } return d; }
   function describe(el) {
     if (!el) return '';
@@ -185,13 +226,15 @@ object SiteScripts {
     if (!u || /^data:/i.test(u) || /^blob:/i.test(u)) return '';
     return abs(u);
   }
+  function isNoise(u) {
+    if (u.split('?')[0].split('#')[0].slice(-4).toLowerCase() === '.svg') return true;
+    return /(logo|avatar|favicon|sprite|emoji|loading|placeholder|banner)/i.test(u);
+  }
   function candidates() {
     var out = [], imgs = document.images;
     for (var i = 0; i < imgs.length; i++) {
       var im = imgs[i], u = urlOf(im);
-      if (!u) continue;
-      if (u.split('?')[0].split('#')[0].slice(-4).toLowerCase() === '.svg') continue;
-      if (/(logo|avatar|favicon|sprite|emoji|loading|placeholder|banner)/i.test(u)) continue;
+      if (!u || isNoise(u)) continue;
       if (im.naturalWidth > 0 && im.naturalWidth < 200) continue;
       if (im.closest && im.closest('header,footer,nav,aside')) continue;
       out.push({ im: im, u: u });
@@ -225,6 +268,9 @@ object SiteScripts {
     });
     return { urls: urls, box: box };
   }
+  if (window.__abdoCollecting) return;
+  window.__abdoCollecting = true;
+  var BR = window.AbdoDl;
   var last = -1, stable = 0, ticks = 0, finished = false;
   function finish() {
     if (finished) return;
@@ -239,8 +285,128 @@ object SiteScripts {
     var atBottom = (window.innerHeight + root.scrollTop) >= (root.scrollHeight - 4);
     var cnt = best().urls.length;
     if (cnt === last) stable++; else { stable = 0; last = cnt; }
-    if ((atBottom && stable >= 6) || ticks > 240) { clearInterval(timer); finish(); }
+    if ((atBottom && stable >= 8) || ticks > 240) { clearInterval(timer); finish(); }
   }, 250);
 })();
+"""
+
+    /** للصفحة المفتوحة أمامك: يقرأ روابط الصور بالترتيب فوراً دون تمرير الصفحة. يُعيد نص JSON. */
+    const val QUICK = """
+(function () {
+  function abs(u) { try { return new URL(u, location.href).href; } catch (e) { return ''; } }
+  function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+  function depthOf(el) { var d = 0; while (el) { d++; el = el.parentElement; } return d; }
+  function describe(el) {
+    if (!el) return '';
+    var c = (typeof el.className === 'string' && el.className) ? ('.' + el.className.trim().split(/\s+/).slice(0, 3).join('.')) : '';
+    return el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + c;
+  }
+  function urlOf(im) {
+    var u = im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('data-original') || im.getAttribute('data-url') || '';
+    if (!u) u = im.currentSrc || im.getAttribute('src') || '';
+    if (!u) { var ss = im.getAttribute('srcset') || ''; if (ss) u = ss.split(',').pop().trim().split(' ')[0]; }
+    if (!u || /^data:/i.test(u) || /^blob:/i.test(u)) return '';
+    return abs(u);
+  }
+  function isNoise(u) {
+    if (u.split('?')[0].split('#')[0].slice(-4).toLowerCase() === '.svg') return true;
+    return /(logo|avatar|favicon|sprite|emoji|loading|placeholder|banner)/i.test(u);
+  }
+  function candidates() {
+    var out = [], imgs = document.images;
+    for (var i = 0; i < imgs.length; i++) {
+      var im = imgs[i], u = urlOf(im);
+      if (!u || isNoise(u)) continue;
+      if (im.naturalWidth > 0 && im.naturalWidth < 200) continue;
+      if (im.closest && im.closest('header,footer,nav,aside')) continue;
+      out.push({ im: im, u: u });
+    }
+    return out;
+  }
+  function pick(list) {
+    var count = new Map();
+    list.forEach(function (c) {
+      var p = c.im.parentElement, d = 0;
+      while (p && p !== document.body && d < 7) { count.set(p, (count.get(p) || 0) + 1); p = p.parentElement; d++; }
+    });
+    var max = 0;
+    count.forEach(function (n) { if (n > max) max = n; });
+    if (!max) return null;
+    var best = null, bestDepth = -1;
+    count.forEach(function (n, el) {
+      if (n >= max * 0.85) { var dp = depthOf(el); if (dp > bestDepth) { bestDepth = dp; best = el; } }
+    });
+    return best;
+  }
+  function best() {
+    var list = candidates();
+    var box = pick(list);
+    var seen = {}, urls = [];
+    list.forEach(function (c) {
+      if (box && !box.contains(c.im)) return;
+      if (seen[c.u]) return;
+      seen[c.u] = 1;
+      urls.push(c.u);
+    });
+    return { urls: urls, box: box };
+  }
+  var CH = /(الفصل|فصل|الحلقة|حلقة|chapter|chap|ch|episode|ep)\s*[.:#\-]?\s*(\d+(?:[.\-]\d+)?)/i;
+  function trimSep(s) {
+    s = clean(s);
+    while (s.length && ' -|:\u2013\u2014\u00B7'.indexOf(s.charAt(s.length - 1)) >= 0) s = s.slice(0, -1);
+    return s;
+  }
+  function cut(s) {
+    s = clean(s);
+    var m = CH.exec(s);
+    if (!m) return { name: trimSep(s), ch: '' };
+    var w = m[1];
+    if (/^[a-z]/i.test(w)) w = 'Chapter'; else if (w === 'فصل') w = 'الفصل';
+    return { name: trimSep(s.substring(0, m.index)), ch: w + ' ' + m[2] };
+  }
+
+  var r = best();
+  var empty = 0;
+  if (r.box) {
+    var all = r.box.querySelectorAll('img');
+    for (var i = 0; i < all.length; i++) {
+      var im = all[i];
+      if (im.naturalWidth > 0 && im.naturalWidth < 200) continue;
+      if (!urlOf(im)) empty++;
+    }
+  }
+
+  var h1 = '', hs = document.querySelectorAll('h1');
+  for (var j = 0; j < hs.length; j++) {
+    var tx = clean(hs[j].innerText || hs[j].textContent);
+    if (tx.length >= 2 && tx.length <= 160) { h1 = tx; break; }
+  }
+  var a1 = cut(h1), a2 = cut(document.title || '');
+  var name = a1.name || a2.name;
+  var chapter = a1.ch || a2.ch;
+
+  var path = location.pathname, mangaUrl = '', mangaText = '', bestLen = 0;
+  var links = document.querySelectorAll('a[href]');
+  for (var k = 0; k < links.length; k++) {
+    var u;
+    try { u = new URL(links[k].getAttribute('href'), location.href); } catch (e) { continue; }
+    if (u.origin !== location.origin) continue;
+    var p = u.pathname;
+    if (p.length < 2 || p === path) continue;
+    var pn = p.charAt(p.length - 1) === '/' ? p : p + '/';
+    if (path.indexOf(pn) !== 0) continue;
+    if (p.length > bestLen) {
+      bestLen = p.length;
+      mangaUrl = u.href;
+      mangaText = clean(links[k].innerText || links[k].textContent);
+    }
+  }
+  if (!name && mangaText && mangaText.length <= 120) name = mangaText;
+
+  return JSON.stringify({
+    urls: r.urls, container: describe(r.box), emptySlots: empty, page: location.href,
+    name: name, chapter: chapter, mangaUrl: mangaUrl, mangaText: mangaText
+  });
+})()
 """
 }
