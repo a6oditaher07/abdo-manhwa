@@ -61,7 +61,11 @@ data class DlRequest(
     val mangaDescription: String,
     val coverUrl: String?,
     val chapterTitle: String,
-    val chapterUrl: String
+    val chapterUrl: String,
+    /** رابط صفحة المانهوا (لجلب الغلاف والنبذة تلقائياً إن لم يُعطَ الغلاف) */
+    val mangaUrl: String? = null,
+    /** روابط الصور إن كانت معروفة مسبقاً (من الصفحة المفتوحة)، فنتجاوز فحص الصفحة المخفية */
+    val imageUrls: List<String>? = null
 )
 
 /** حالة مهمة تحميل فصل واحد. المفتاح هو رابط صفحة الفصل. */
@@ -71,6 +75,7 @@ data class DlTask(
     val mangaDescription: String,
     val coverUrl: String?,
     val chapterTitle: String,
+    val mangaUrl: String? = null,
     val status: DlStatus = DlStatus.QUEUED,
     val done: Int = 0,
     val total: Int = 0,
@@ -137,10 +142,15 @@ object DownloadCenter {
                     mangaTitle = it.mangaTitle.trim(),
                     mangaDescription = it.mangaDescription,
                     coverUrl = it.coverUrl,
-                    chapterTitle = it.chapterTitle
+                    chapterTitle = it.chapterTitle,
+                    mangaUrl = it.mangaUrl
                 )
             }
         if (fresh.isEmpty()) return
+        requests.forEach { r ->
+            val known = r.imageUrls
+            if (!known.isNullOrEmpty() && fresh.any { it.key == r.chapterUrl }) urlsCache[r.chapterUrl] = known
+        }
         _tasks.value = current.filter { old -> fresh.none { it.key == old.key } } + fresh
         pump()
     }
@@ -268,15 +278,27 @@ object DownloadCenter {
         update(key) { copy(status = DlStatus.DOWNLOADING, total = urls.size, done = startDone) }
 
         downloadImages(key, urls, staging)
+        // تأكد أن كل الصور موجودة بالترتيب وسليمة، وأعد تحميل التالف مرة واحدة
+        verifyAndRepair(key, urls, staging)
 
         withContext(Dispatchers.IO) { writeHtml(staging, task.chapterTitle) }
 
         importMutex.withLock {
             val existing = repository.findMangaByTitle(task.mangaTitle)
-            val cover = if (existing?.coverPath == null) fetchCover(task) else null
+            var cover: File? = null
+            var description = task.mangaDescription
+            if (existing == null || existing.coverPath == null) {
+                var coverUrl = task.coverUrl
+                if ((coverUrl == null || description.isBlank()) && task.mangaUrl != null) {
+                    val meta = fetchMangaMeta(task.mangaUrl)
+                    if (coverUrl == null) coverUrl = meta.first
+                    if (description.isBlank()) description = meta.second.orEmpty()
+                }
+                cover = fetchCover(task.copy(coverUrl = coverUrl))
+            }
             repository.importDownloadedChapter(
                 mangaTitle = task.mangaTitle,
-                description = task.mangaDescription,
+                description = description,
                 coverFile = cover,
                 chapterTitle = task.chapterTitle,
                 stagingDir = staging,
@@ -468,6 +490,63 @@ object DownloadCenter {
             }
         }
         throw IOException("فشل تحميل صورة ${index + 1}: ${lastError?.message}")
+    }
+
+    private fun isValidImage(file: File?): Boolean {
+        if (file == null || !file.exists() || file.length() == 0L) return false
+        return if (file.extension.lowercase() in setOf("jpg", "png", "webp", "gif")) {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, opts)
+            opts.outWidth > 0 && opts.outHeight > 0
+        } else true
+    }
+
+    /** يتحقق أن كل صورة (1..N) موجودة وتُفتح، ويعيد تحميل التالف مرة واحدة، وإلا يفشل الفصل */
+    private suspend fun verifyAndRepair(key: String, urls: List<String>, dir: File) {
+        withContext(Dispatchers.IO) {
+            for (round in 0..1) {
+                val bad = urls.indices.filter { !isValidImage(existingImage(dir, it)) }
+                if (bad.isEmpty()) return@withContext
+                if (round == 1) throw IOException("الصورة رقم ${bad.first() + 1} تالفة أو ناقصة")
+                bad.forEach { existingImage(dir, it)?.delete() }
+                val semaphore = Semaphore(PARALLEL)
+                coroutineScope {
+                    bad.map { i ->
+                        async { semaphore.withPermit { downloadOne(urls[i], dir, i, referer = key) } }
+                    }.awaitAll()
+                }
+            }
+        }
+    }
+
+    private fun metaContent(html: String, prop: String): String? {
+        val flags = setOf(RegexOption.IGNORE_CASE)
+        val first = Regex("<meta[^>]+(?:property|name)=[\"']$prop[\"'][^>]*content=[\"']([^\"']*)[\"']", flags)
+        val second = Regex("<meta[^>]+content=[\"']([^\"']*)[\"'][^>]*(?:property|name)=[\"']$prop[\"']", flags)
+        val raw = first.find(html)?.groupValues?.get(1) ?: second.find(html)?.groupValues?.get(1)
+        return raw?.replace("&amp;", "&")?.replace("&quot;", "\"")?.replace("&#039;", "'")
+            ?.replace("&#39;", "'")?.trim()?.ifBlank { null }
+    }
+
+    /** يجلب غلاف المانهوا ونبذتها من وسوم og: في صفحتها. أي فشل يُعيد (null, null) بصمت. */
+    private suspend fun fetchMangaMeta(mangaUrl: String): Pair<String?, String?> = withContext(Dispatchers.IO) {
+        try {
+            val conn = openConnection(mangaUrl, mangaUrl)
+            conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+            try {
+                if (conn.responseCode !in 200..299) return@withContext null to null
+                val html = conn.inputStream.bufferedReader().use { it.readText() }.take(400_000)
+                val image = metaContent(html, "og:image")?.let {
+                    try { URL(URL(mangaUrl), it).toString() } catch (e: Exception) { null }
+                }
+                val description = metaContent(html, "og:description") ?: metaContent(html, "description")
+                image to description?.take(800)
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            null to null
+        }
     }
 
     // ───────────────────────── المرحلة 3: HTML والغلاف ─────────────────────────
