@@ -3,10 +3,12 @@ package com.abdo.manhwa.download
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
@@ -16,6 +18,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import androidx.core.content.ContextCompat
 import com.abdo.manhwa.data.repository.FileStorageManager
 import com.abdo.manhwa.data.repository.MangaRepository
 import com.abdo.manhwa.data.repository.normalizeTitleKey
@@ -29,8 +32,11 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -48,6 +54,9 @@ import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
@@ -62,7 +71,7 @@ data class DlRequest(
     val coverUrl: String?,
     val chapterTitle: String,
     val chapterUrl: String,
-    /** رابط صفحة المانهوا (لجلب الغلاف والنبذة تلقائياً إن لم يُعطَ الغلاف) */
+    /** رابط صفحة المانهوا (لجلب الغلاف والنبذة تلقائياً إن لم تُعطَ) */
     val mangaUrl: String? = null,
     /** روابط الصور إن كانت معروفة مسبقاً (من الصفحة المفتوحة)، فنتجاوز فحص الصفحة المخفية */
     val imageUrls: List<String>? = null
@@ -85,16 +94,19 @@ data class DlTask(
 }
 
 /**
- * مركز التحميل: طابور فصول، كل فصل يمرّ بثلاث مراحل:
- * 1) فحص صفحة الفصل داخل WebView مخفي لجمع روابط الصور (مع تمرير تلقائي للصور الكسولة).
- * 2) تحميل الصور بالتوازي إلى مجلد مؤقت، مع إمكانية الإيقاف والاستئناف (الصور المكتملة لا تُعاد).
- * 3) توليد index.html وإضافة الفصل (والمانهوا إن لزم) إلى المكتبة.
+ * مركز التحميل. كل فصل يمرّ بثلاث مراحل:
+ * 1) فحص صفحة الفصل (في صفحة مخفية) لجمع روابط الصور، أو استخدام الروابط الجاهزة من الصفحة المفتوحة.
+ * 2) تحميل الصور بالتوازي إلى مجلد مؤقت مع إيقاف/استئناف، ثم التحقق من سلامتها وترتيبها.
+ * 3) توليد index.html وإضافة الفصل (والمانهوا بغلافها ونبذتها إن لزم) إلى المكتبة.
+ * الفصول تُحمَّل واحداً بعد الآخر، وخدمة أمامية (DownloadService) تُبقي التحميل شغالاً وتعرض إشعار التقدم.
  */
 object DownloadCenter {
 
-    private const val MAX_ACTIVE = 2
+    private const val MAX_ACTIVE = 1
     private const val PARALLEL = 4
     private const val EXTRACT_TIMEOUT_MS = 120_000L
+    private const val FULL_TIMEOUT_MS = 150_000L
+    private const val SCAN_TIMEOUT_MS = 45_000L
 
     private lateinit var appContext: Context
     private lateinit var repository: MangaRepository
@@ -107,9 +119,23 @@ object DownloadCenter {
     private val _tasks = MutableStateFlow<List<DlTask>>(emptyList())
     val tasks: StateFlow<List<DlTask>> = _tasks.asStateFlow()
 
+    /** اسم المانهوا التي تُجمع فصولها الآن (قبل بدء التحميل)، أو null */
+    private val _collecting = MutableStateFlow<String?>(null)
+    val collecting: StateFlow<String?> = _collecting.asStateFlow()
+
+    /** رسائل قصيرة للمستخدم (تُعرض كإشعار منبثق داخل المتصفح) */
+    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val messages: SharedFlow<String> = _messages.asSharedFlow()
+
+    /** آخر أحداث التحميل للتشخيص (تُضمَّن في «نسخ تقرير الفحص») */
+    private val _report = MutableStateFlow("")
+    val report: StateFlow<String> = _report.asStateFlow()
+
     // تُستخدم من الخيط الرئيسي فقط
     private val jobs = HashMap<String, Job>()
     private val urlsCache = HashMap<String, List<String>>()
+    private val metaCache = HashMap<String, ScanResult>()
+    private val metaFailures = HashMap<String, Int>()
     private val importMutex = Mutex()
     private var host: WeakReference<Activity>? = null
 
@@ -121,18 +147,35 @@ object DownloadCenter {
         initialized = true
     }
 
-    /** النشاط الذي يستضيف الـ WebView المخفي لفحص الفصول (يُسجَّل من واجهة التنقل) */
+    /** النشاط الذي يستضيف صفحة الفحص المخفية عندما يكون التطبيق ظاهراً */
     fun setHost(activity: Activity?) {
         host = activity?.let { WeakReference(it) }
     }
 
+    private fun log(message: String) {
+        val line = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + " " + message
+        _report.update { old ->
+            (old.lines().filter { it.isNotBlank() } + line).takeLast(40).joinToString("\n")
+        }
+    }
+
+    private fun say(message: String) {
+        _messages.tryEmit(message)
+    }
+
+    private fun isActive(status: DlStatus): Boolean =
+        status == DlStatus.QUEUED || status == DlStatus.EXTRACTING || status == DlStatus.DOWNLOADING
+
     // ───────────────────────── واجهة التحكم ─────────────────────────
 
     fun enqueue(requests: List<DlRequest>) {
-        val current = _tasks.value
+        if (!initialized) return
+        val all = _tasks.value
+        // عند بدء دفعة جديدة والطابور فارغ نمسح الفصول المكتملة من الدفعة السابقة
+        val base = if (all.none { isActive(it.status) }) all.filter { it.status != DlStatus.DONE } else all
         val fresh = requests
             .filter { r ->
-                current.none {
+                base.none {
                     it.key == r.chapterUrl && it.status != DlStatus.DONE && it.status != DlStatus.FAILED
                 }
             }
@@ -151,16 +194,75 @@ object DownloadCenter {
             val known = r.imageUrls
             if (!known.isNullOrEmpty() && fresh.any { it.key == r.chapterUrl }) urlsCache[r.chapterUrl] = known
         }
-        _tasks.value = current.filter { old -> fresh.none { it.key == old.key } } + fresh
+        _tasks.value = base.filter { old -> fresh.none { it.key == old.key } } + fresh
         pump()
+    }
+
+    /**
+     * تحميل كل فصول مانهوا من صفحتها: يجمع الفصول من كل صفحات الترقيم (ويتجاهل الأعمال المشابهة)،
+     * ثم يضيف غير الموجود منها في المكتبة إلى الطابور من الأقدم إلى الأحدث.
+     * [seed] هو ما فُحص في الصفحة المفتوحة أصلاً، و[nameOverride] اسم المانهوا الذي اختاره المستخدم.
+     */
+    fun downloadWholeManga(pageUrl: String, seed: ScanResult?, nameOverride: String?) {
+        if (!initialized) return
+        ensureService()
+        scope.launch {
+            val label = nameOverride?.takeIf { it.isNotBlank() } ?: seed?.title ?: "المانهوا"
+            _collecting.value = label
+            log("جمع فصول $label من $pageUrl")
+            try {
+                val chapters = LinkedHashMap<String, ScanChapter>()
+                seed?.chapters?.forEach { chapters[it.url] = it }
+                var title = seed?.title.orEmpty()
+                var cover = seed?.cover
+                var description = seed?.description.orEmpty()
+
+                val full = collectAllPages(pageUrl)
+                if (full != null) {
+                    full.chapters.forEach { if (!chapters.containsKey(it.url)) chapters[it.url] = it }
+                    if (title.isBlank()) title = full.title
+                    if (cover == null) cover = full.cover
+                    if (description.isBlank()) description = full.description
+                }
+
+                val name = nameOverride?.takeIf { it.isNotBlank() } ?: title
+                if (chapters.isEmpty() || name.isBlank()) {
+                    say("لم أجد فصولاً في هذه الصفحة")
+                    return@launch
+                }
+                val have = repository.downloadedChapterKeys(name)
+                val ordered = chapters.values.withIndex()
+                    .sortedWith(compareBy<IndexedValue<ScanChapter>>({ chapterNumber(it.value.title) }, { it.index }))
+                    .map { it.value }
+                val requests = ordered
+                    .filter { normalizeTitleKey(it.title) !in have }
+                    .map {
+                        DlRequest(
+                            mangaTitle = name,
+                            mangaDescription = description,
+                            coverUrl = cover,
+                            chapterTitle = it.title,
+                            chapterUrl = it.url.substringBefore('#'),
+                            mangaUrl = pageUrl
+                        )
+                    }
+                log("وُجد ${chapters.size} فصل، منها ${requests.size} غير موجود في المكتبة")
+                if (requests.isEmpty()) {
+                    say("كل الفصول (${chapters.size}) موجودة في المكتبة")
+                } else {
+                    enqueue(requests)
+                    say("بدأ تحميل ${requests.size} فصل من ${chapters.size}")
+                }
+            } finally {
+                _collecting.value = null
+            }
+        }
     }
 
     fun pause(key: String) {
         jobs[key]?.cancel()
         update(key) {
-            if (status == DlStatus.QUEUED || status == DlStatus.EXTRACTING || status == DlStatus.DOWNLOADING) {
-                copy(status = DlStatus.PAUSED)
-            } else this
+            if (isActive(status)) copy(status = DlStatus.PAUSED) else this
         }
         pump()
     }
@@ -200,6 +302,11 @@ object DownloadCenter {
 
     fun keyOf(title: String): String = normalizeTitleKey(title)
 
+    private fun chapterNumber(title: String): Double {
+        val m = Regex("(\\d+(?:[.\\-]\\d+)?)").find(title) ?: return Double.MAX_VALUE
+        return m.value.replace('-', '.').toDoubleOrNull() ?: Double.MAX_VALUE
+    }
+
     // ───────────────────────── الجدولة ─────────────────────────
 
     private fun update(key: String, block: DlTask.() -> DlTask) {
@@ -209,14 +316,27 @@ object DownloadCenter {
     private fun current(key: String): DlTask? = _tasks.value.firstOrNull { it.key == key }
 
     private fun fail(key: String, message: String) {
+        log("فشل ${current(key)?.chapterTitle}: $message")
         update(key) { copy(status = DlStatus.FAILED, error = message) }
+    }
+
+    /** يبدأ الخدمة الأمامية التي تُبقي التحميل شغالاً في الخلفية وتعرض الإشعار */
+    private fun ensureService() {
+        if (!initialized || DownloadService.running) return
+        try {
+            ContextCompat.startForegroundService(appContext, Intent(appContext, DownloadService::class.java))
+        } catch (e: Exception) {
+            log("تعذّر بدء خدمة التحميل: ${e.message}")
+        }
     }
 
     private fun pump() {
         if (!initialized) return
-        val running = _tasks.value.count { it.status == DlStatus.EXTRACTING || it.status == DlStatus.DOWNLOADING }
+        val tasks = _tasks.value
+        if (tasks.any { isActive(it.status) }) ensureService()
+        val running = tasks.count { it.status == DlStatus.EXTRACTING || it.status == DlStatus.DOWNLOADING }
         var slots = MAX_ACTIVE - running
-        for (task in _tasks.value) {
+        for (task in tasks) {
             if (slots <= 0) break
             if (task.status == DlStatus.QUEUED && jobs[task.key]?.isActive != true) {
                 start(task.key)
@@ -285,17 +405,19 @@ object DownloadCenter {
 
         importMutex.withLock {
             val existing = repository.findMangaByTitle(task.mangaTitle)
-            var cover: File? = null
+            val needCover = existing == null || existing.coverPath == null
+            val needDesc = existing == null || existing.description.isBlank()
+            var coverUrl = task.coverUrl
             var description = task.mangaDescription
-            if (existing == null || existing.coverPath == null) {
-                var coverUrl = task.coverUrl
-                if ((coverUrl == null || description.isBlank()) && task.mangaUrl != null) {
-                    val meta = fetchMangaMeta(task.mangaUrl)
-                    if (coverUrl == null) coverUrl = meta.first
-                    if (description.isBlank()) description = meta.second.orEmpty()
-                }
-                cover = fetchCover(task.copy(coverUrl = coverUrl))
+            if (((needCover && coverUrl == null) || (needDesc && description.isBlank())) && task.mangaUrl != null) {
+                val meta = metaFor(task.mangaUrl)
+                if (coverUrl == null) coverUrl = meta?.cover
+                if (description.isBlank()) description = meta?.description.orEmpty()
             }
+            val cover = if (needCover && coverUrl != null) {
+                fetchCover(coverUrl, task.mangaUrl ?: task.key, task.mangaTitle)
+            } else null
+            log("إضافة ${task.mangaTitle} / ${task.chapterTitle}: غلاف=${cover != null}، طول النبذة=${description.length}")
             repository.importDownloadedChapter(
                 mangaTitle = task.mangaTitle,
                 description = description,
@@ -309,68 +431,67 @@ object DownloadCenter {
         update(key) { copy(status = DlStatus.DONE, done = urls.size, total = urls.size, error = null) }
     }
 
-    // ───────────────────────── المرحلة 1: جمع روابط الصور ─────────────────────────
+    // ───────────────────────── الصفحات المخفية (فحص الفصول والمانهوا) ─────────────────────────
 
-    private suspend fun awaitHost(): Activity {
-        while (true) {
-            host?.get()?.let { if (!it.isFinishing) return it }
-            delay(500)
-        }
-    }
-
+    /**
+     * يفتح [url] في WebView مخفي، وبعد اكتمال التحميل بـ[startDelayMs] ينفّذ [script]
+     * وينتظر أن يستدعي السكربت AbdoDl.result(json)، ثم يُعيد نص JSON.
+     * إن كان التطبيق ظاهراً يُضاف المتصفح المخفي إلى النافذة (شبه شفاف ولا يلتقط اللمس)،
+     * وإلا (التحميل في الخلفية) يعمل بلا نافذة بمقاس شاشة افتراضي.
+     */
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun extractImageUrls(chapterUrl: String): List<String> {
-        return withTimeout(EXTRACT_TIMEOUT_MS) {
-            val activity = awaitHost()
-            suspendCancellableCoroutine<List<String>> { cont ->
-                val root = activity.window.decorView as ViewGroup
+    private suspend fun runInHiddenPage(url: String, script: String, timeoutMs: Long, startDelayMs: Long): String {
+        return withTimeout(timeoutMs) {
+            suspendCancellableCoroutine<String> { cont ->
                 val finished = AtomicBoolean(false)
-
-                // WebView شبه شفاف بحجم الشاشة (ليحسب الموقع نافذة عرض حقيقية) لكنه لا يلتقط اللمس
-                val wv = object : WebView(activity) {
-                    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
+                val hostActivity: Activity? = host?.get()?.takeIf {
+                    !it.isFinishing && !it.isDestroyed && it.window.decorView.windowVisibility == View.VISIBLE
                 }
+                val dm = appContext.resources.displayMetrics
+                val root: ViewGroup? = hostActivity?.window?.decorView as? ViewGroup
+                val wv: WebView = if (hostActivity != null) {
+                    object : WebView(hostActivity) {
+                        override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
+                    }
+                } else {
+                    WebView(appContext)
+                }
+
                 fun cleanup() {
                     mainHandler.post {
                         try {
-                            root.removeView(wv)
+                            root?.removeView(wv)
                             wv.stopLoading()
                             wv.destroy()
                         } catch (_: Exception) {
                         }
                     }
                 }
-                fun deliver(result: Result<List<String>>) {
+
+                fun deliver(result: Result<String>) {
                     if (!finished.compareAndSet(false, true)) return
                     cleanup()
                     if (!cont.isActive) return
                     result.fold({ cont.resume(it) }, { cont.resumeWithException(it) })
                 }
 
-                wv.alpha = 0.01f
                 wv.settings.javaScriptEnabled = true
                 wv.settings.domStorageEnabled = true
                 wv.settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-
-                wv.addJavascriptInterface(DlJsBridge { json ->
-                    try {
-                        val arr = JSONObject(json).getJSONArray("urls")
-                        deliver(Result.success((0 until arr.length()).map { arr.getString(it) }))
-                    } catch (e: Exception) {
-                        deliver(Result.failure(IOException("تعذّر قراءة صور الفصل")))
-                    }
-                }, "AbdoDl")
+                wv.addJavascriptInterface(DlJsBridge { json -> deliver(Result.success(json)) }, "AbdoDl")
 
                 wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, url: String?) {
-                        view.evaluateJavascript(SiteScripts.COLLECT, null)
+                    override fun onPageFinished(view: WebView, pageUrl: String?) {
+                        mainHandler.postDelayed({
+                            if (!finished.get()) view.evaluateJavascript(script, null)
+                        }, startDelayMs)
                     }
 
                     override fun onReceivedError(view: WebView, request: WebResourceRequest?, error: WebResourceError?) {
                         if (request?.isForMainFrame == true) {
-                            deliver(Result.failure(IOException("تعذّر فتح صفحة الفصل (تحقق من الاتصال)")))
+                            deliver(Result.failure(IOException("تعذّر فتح الصفحة (تحقق من الاتصال)")))
                         }
                     }
 
@@ -379,22 +500,111 @@ object DownloadCenter {
                         request: WebResourceRequest?,
                         errorResponse: WebResourceResponse?
                     ) {
-                        if (request?.isForMainFrame == true && (errorResponse?.statusCode ?: 0) >= 400) {
-                            deliver(
-                                Result.failure(
-                                    IOException("رفض الموقع فتح الفصل (${errorResponse?.statusCode}). افتح الموقع في المتصفح ثم أعد المحاولة")
-                                )
-                            )
+                        val code = errorResponse?.statusCode ?: 0
+                        if (request?.isForMainFrame == true && code >= 400) {
+                            deliver(Result.failure(IOException("رفض الموقع فتح الصفحة ($code). افتح الموقع في المتصفح ثم أعد المحاولة")))
                         }
                     }
                 }
 
-                val dm = activity.resources.displayMetrics
-                root.addView(wv, FrameLayout.LayoutParams(dm.widthPixels, dm.heightPixels))
+                if (root != null) {
+                    wv.alpha = 0.01f
+                    root.addView(wv, FrameLayout.LayoutParams(dm.widthPixels, dm.heightPixels))
+                } else {
+                    wv.measure(
+                        View.MeasureSpec.makeMeasureSpec(dm.widthPixels, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(dm.heightPixels, View.MeasureSpec.EXACTLY)
+                    )
+                    wv.layout(0, 0, dm.widthPixels, dm.heightPixels)
+                }
                 cont.invokeOnCancellation { finished.set(true); cleanup() }
-                wv.loadUrl(chapterUrl)
+                wv.loadUrl(url)
             }
         }
+    }
+
+    private suspend fun extractImageUrls(chapterUrl: String): List<String> {
+        val json = runInHiddenPage(chapterUrl, SiteScripts.COLLECT, EXTRACT_TIMEOUT_MS, 0)
+        val arr = JSONObject(json).getJSONArray("urls")
+        return (0 until arr.length()).map { arr.getString(it) }
+    }
+
+    /** يجمع كل الفصول عبر صفحات الترقيم: بالنقر على أرقام الصفحات، أو بزيارة روابطها إن كانت روابط حقيقية */
+    private suspend fun collectAllPages(pageUrl: String): ScanResult? {
+        val first = try {
+            ScanResult.fromJson(runInHiddenPage(pageUrl, SiteScripts.FULL, FULL_TIMEOUT_MS, 2500))
+        } catch (e: TimeoutCancellationException) {
+            log("انتهت مهلة جمع صفحات الفصول")
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("فشل جمع صفحات الفصول: ${e.message}")
+            null
+        } ?: return null
+        log("جمع الصفحات: ${first.chapters.size} فصل، روابط ترقيم=${first.pageUrls.size}")
+
+        val merged = LinkedHashMap<String, ScanChapter>()
+        first.chapters.forEach { merged[it.url] = it }
+        val visited = hashSetOf(pageUrl)
+        val queue = ArrayDeque(first.pageUrls)
+        var guard = 0
+        while (queue.isNotEmpty() && guard < 40) {
+            val next = queue.removeFirst()
+            if (!visited.add(next)) continue
+            guard++
+            val page = try {
+                ScanResult.fromJson(runInHiddenPage(next, SiteScripts.SCAN_HIDDEN, SCAN_TIMEOUT_MS, 2000))
+            } catch (e: TimeoutCancellationException) {
+                null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            page.chapters.forEach { if (!merged.containsKey(it.url)) merged[it.url] = it }
+            page.pageUrls.forEach { if (it !in visited) queue.addLast(it) }
+        }
+        return first.copy(chapters = merged.values.toList())
+    }
+
+    /** غلاف ونبذة المانهوا من صفحتها (فحص في صفحة مخفية، وإلا وسوم og: عبر HTTP) */
+    private suspend fun metaFor(mangaUrl: String): ScanResult? {
+        metaCache[mangaUrl]?.let { return it }
+        if ((metaFailures[mangaUrl] ?: 0) >= 2) return null
+
+        var out: ScanResult? = try {
+            ScanResult.fromJson(runInHiddenPage(mangaUrl, SiteScripts.SCAN_HIDDEN, SCAN_TIMEOUT_MS, 2500))
+        } catch (e: TimeoutCancellationException) {
+            log("انتهت مهلة فحص صفحة المانهوا")
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("فشل فحص صفحة المانهوا: ${e.message}")
+            null
+        }
+        if (out == null || (out.cover == null && out.description.isBlank())) {
+            val (image, desc) = fetchMangaMeta(mangaUrl)
+            if (image != null || desc != null) {
+                out = ScanResult(
+                    url = mangaUrl,
+                    title = out?.title.orEmpty(),
+                    cover = out?.cover ?: image,
+                    description = out?.description?.takeIf { it.isNotBlank() } ?: desc.orEmpty(),
+                    chapters = emptyList(),
+                    pageUrls = emptyList(),
+                    diagnostics = ""
+                )
+            }
+        }
+        log("بيانات المانهوا: غلاف=${out?.cover != null}، طول النبذة=${out?.description?.length ?: 0}")
+        if (out != null && (out.cover != null || out.description.isNotBlank())) {
+            metaCache[mangaUrl] = out
+        } else {
+            metaFailures[mangaUrl] = (metaFailures[mangaUrl] ?: 0) + 1
+        }
+        return out
     }
 
     // ───────────────────────── المرحلة 2: تحميل الصور ─────────────────────────
@@ -577,15 +787,18 @@ object DownloadCenter {
         File(dir, "index.html").writeText(sb.toString())
     }
 
-    private suspend fun fetchCover(task: DlTask): File? = withContext(Dispatchers.IO) {
-        val url = task.coverUrl ?: return@withContext null
-        try {
-            val part = File(appContext.cacheDir, "cover_" + hashOf(task.mangaTitle) + ".part")
-            val ext = fetchTo(url, task.key, part)
-            val dest = File(appContext.cacheDir, "cover_" + hashOf(task.mangaTitle) + "." + ext)
-            if (part.renameTo(dest)) dest else null
-        } catch (e: Exception) {
-            null
+    private suspend fun fetchCover(coverUrl: String, referer: String, name: String): File? =
+        withContext(Dispatchers.IO) {
+            try {
+                val base = "cover_" + hashOf(name)
+                val part = File(appContext.cacheDir, "$base.part")
+                val ext = fetchTo(coverUrl, referer, part)
+                val dest = File(appContext.cacheDir, "$base.$ext")
+                if (dest.exists()) dest.delete()
+                if (part.renameTo(dest)) dest else null
+            } catch (e: Exception) {
+                log("فشل تحميل الغلاف: ${e.message}")
+                null
+            }
         }
-    }
 }
