@@ -1,17 +1,23 @@
 package com.abdo.manhwa.ui.browser
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.os.Build
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardActions
@@ -22,12 +28,17 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import coil.compose.AsyncImage
 import com.abdo.manhwa.download.DlRequest
 import com.abdo.manhwa.download.DlStatus
 import com.abdo.manhwa.download.DlTask
@@ -87,6 +98,17 @@ fun BrowserScreen(onBack: () -> Unit) {
     val activeCount = tasks.count {
         it.status == DlStatus.QUEUED || it.status == DlStatus.EXTRACTING || it.status == DlStatus.DOWNLOADING
     }
+    val collecting by DownloadCenter.collecting.collectAsState()
+
+    // إذن الإشعارات (أندرويد 13+): مطلوب لإظهار تقدّم التحميل في شريط الإشعارات
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     fun load(raw: String) {
         val url = normalizeUrl(raw)
@@ -103,8 +125,13 @@ fun BrowserScreen(onBack: () -> Unit) {
             webView?.evaluateJavascript(SiteScripts.SCAN) { raw ->
                 val result = ScanResult.parse(raw)
                 if (result != null) {
-                    scan = result
-                    if (result.chapters.isNotEmpty()) remembered = result
+                    // إن فحصنا نفس صفحة المانهوا مرة أخرى (بعد التنقل بين صفحات الترقيم) نجمع الفصول معاً
+                    val old = remembered
+                    val merged = if (old != null && old.url == result.url && result.chapters.isNotEmpty()) {
+                        result.copy(chapters = (old.chapters + result.chapters).distinctBy { it.url })
+                    } else result
+                    scan = merged
+                    if (merged.chapters.isNotEmpty()) remembered = merged
                 }
             }
         }
@@ -122,6 +149,7 @@ fun BrowserScreen(onBack: () -> Unit) {
     }
 
     fun startDownload(d: ReaderDraft) {
+        ensureNotificationPermission()
         d.quick.mangaUrl?.let { prefs.edit().putString("name:" + it, d.mangaName).apply() }
         DownloadCenter.enqueue(
             listOf(
@@ -168,6 +196,19 @@ fun BrowserScreen(onBack: () -> Unit) {
                 if (confident) startDownload(d) else draft = d
             }
         }
+    }
+
+    /** تحميل كل فصول المانهوا الظاهرة في الصفحة: يجمعها من كل صفحات الترقيم ثم يحمّلها بالترتيب */
+    fun downloadAll(name: String) {
+        val s = scan ?: return
+        ensureNotificationPermission()
+        DownloadCenter.downloadWholeManga(pageUrl = s.url, seed = s, nameOverride = name)
+        showSheet = false
+    }
+
+    // رسائل مركز التحميل (مثل: بدأ تحميل 120 فصل)
+    LaunchedEffect(Unit) {
+        DownloadCenter.messages.collect { snackbarHost.showSnackbar(it) }
     }
 
     // إشعار عند اكتمال إضافة فصل إلى المكتبة (لا نكرر إشعار فصول اكتملت قبل فتح المتصفح)
@@ -261,7 +302,8 @@ fun BrowserScreen(onBack: () -> Unit) {
                                     showMenu = false
                                     val report = listOfNotNull(
                                         scan?.diagnostics?.ifBlank { null },
-                                        quick?.summary
+                                        quick?.summary,
+                                        DownloadCenter.report.value.ifBlank { null }
                                     ).joinToString("\n").ifBlank { "لا توجد نتيجة فحص لهذه الصفحة: ${webView?.url}" }
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                     cm.setPrimaryClip(ClipData.newPlainText("abdo-scan", report))
@@ -288,6 +330,7 @@ fun BrowserScreen(onBack: () -> Unit) {
             val hereTask = q?.let { qq -> tasks.firstOrNull { it.key == chapterKey(qq.page) } }
 
             val label: String? = when {
+                collecting != null -> "جارٍ جمع الفصول…"
                 hereTask != null -> when (hereTask.status) {
                     DlStatus.QUEUED -> "في الانتظار…"
                     DlStatus.EXTRACTING -> "جارٍ تجهيز الفصل…"
@@ -447,7 +490,10 @@ fun BrowserScreen(onBack: () -> Unit) {
         ChapterSheet(
             scan = scan,
             tasks = tasks,
+            collecting = collecting,
             onRescan = { scanPage() },
+            onBeforeDownload = { ensureNotificationPermission() },
+            onDownloadAll = { name -> downloadAll(name) },
             onDismiss = { showSheet = false }
         )
     }
@@ -458,7 +504,10 @@ fun BrowserScreen(onBack: () -> Unit) {
 private fun ChapterSheet(
     scan: ScanResult?,
     tasks: List<DlTask>,
+    collecting: String?,
     onRescan: () -> Unit,
+    onBeforeDownload: () -> Unit,
+    onDownloadAll: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -480,7 +529,8 @@ private fun ChapterSheet(
         mangaDescription = scan?.description.orEmpty(),
         coverUrl = scan?.cover,
         chapterTitle = ch.title,
-        chapterUrl = ch.url
+        chapterUrl = ch.url.substringBefore('#'),
+        mangaUrl = scan?.url
     )
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
@@ -492,12 +542,52 @@ private fun ChapterSheet(
                 TextButton(onClick = onRescan) { Text("إعادة الفحص") }
             }
 
-            OutlinedTextField(
-                value = mangaName,
-                onValueChange = { mangaName = it },
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                if (scan?.cover != null) {
+                    AsyncImage(
+                        model = scan.cover,
+                        contentDescription = "الغلاف",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.width(72.dp).height(104.dp).clip(RoundedCornerShape(8.dp))
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    OutlinedTextField(
+                        value = mangaName,
+                        onValueChange = { mangaName = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("اسم المانهوا في المكتبة") }
+                    )
+                    val desc = scan?.description.orEmpty()
+                    Text(
+                        text = if (desc.isNotBlank()) desc else "لم أعثر على نبذة في هذه الصفحة",
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                onClick = { onDownloadAll(mangaName.ifBlank { scan?.title.orEmpty() }) },
+                enabled = chapters.isNotEmpty() && collecting == null,
                 modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                label = { Text("اسم المانهوا في المكتبة") }
+                colors = ButtonDefaults.buttonColors(containerColor = AccentPrimary)
+            ) {
+                Text(
+                    if (collecting != null) "جارٍ جمع الفصول من كل الصفحات…"
+                    else "تحميل كل الفصول (من كل الصفحات)"
+                )
+            }
+            Text(
+                "يجمع كل فصول المانهوا ويتجاهل الأعمال المشابهة، ويحمّلها واحداً بعد الآخر، ثم تُضاف إلى مكتبتك مرتبة. يستمر التحميل في الخلفية مع إشعار بالتقدم.",
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.padding(top = 4.dp)
             )
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -510,6 +600,7 @@ private fun ChapterSheet(
                         .map { it.url }.toSet()
                 }) { Text("غير المحمّلة") }
                 TextButton(onClick = { selected = emptySet() }) { Text("مسح") }
+                TextButton(onClick = onRescan) { Text("إعادة الفحص") }
                 Spacer(modifier = Modifier.weight(1f))
                 IconButton(onClick = { DownloadCenter.pauseAll() }) {
                     Icon(Icons.Filled.Pause, contentDescription = "إيقاف الكل")
@@ -540,7 +631,7 @@ private fun ChapterSheet(
                         inLibrary = DownloadCenter.keyOf(ch.title) in downloaded,
                         checked = ch.url in selected,
                         onCheckedChange = { on -> selected = if (on) selected + ch.url else selected - ch.url },
-                        onDownload = { DownloadCenter.enqueue(listOf(requestFor(ch))) }
+                        onDownload = { onBeforeDownload(); DownloadCenter.enqueue(listOf(requestFor(ch))) }
                     )
                 }
             }
@@ -551,6 +642,7 @@ private fun ChapterSheet(
                 onClick = {
                     // الأقدم أولاً (القائمة في الموقع من الأحدث للأقدم) لتمتلئ المكتبة بالترتيب
                     val requests = chapters.reversed().filter { it.url in selected }.map { requestFor(it) }
+                    onBeforeDownload()
                     DownloadCenter.enqueue(requests)
                     selected = emptySet()
                 },
