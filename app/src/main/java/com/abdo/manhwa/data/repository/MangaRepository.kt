@@ -208,6 +208,11 @@ class MangaRepository(context: Context) {
             }
         }
 
+        // مانهوا موجودة بلا نبذة (مثلاً أُضيفت سابقاً بدونها): نكمل النبذة الآن
+        if (existing != null && existing.description.isBlank() && description.isNotBlank()) {
+            mangaDao.getById(mangaId)?.let { mangaDao.update(it.copy(description = description)) }
+        }
+
         val target = fileStorage.importChapterDirectory(folder, stagingDir, dirName)
             ?: throw IllegalStateException("تعذّر حفظ مجلد الفصل")
         val htmlPath = File(target, "index.html").absolutePath
